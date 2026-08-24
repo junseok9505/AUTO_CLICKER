@@ -16,6 +16,12 @@ import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
+# 마우스 버튼을 누르고 있는 시간. 짧을수록 반응이 빠르지만, 너무 짧으면
+# 클릭을 무시하는 앱이 있을 수 있어 10ms 로 둔다.
+CLICK_HOLD_SECONDS = 0.01
+# 커서 이동이 반영됐는지 확인하는 폴링 간격
+CURSOR_POLL_SECONDS = 0.002
+
 
 class PlatformAdapter(ABC):
     name = "unknown"
@@ -51,8 +57,8 @@ class PlatformAdapter(ABC):
     def move_cursor(self, x: int, y: int) -> None: ...
 
     @abstractmethod
-    def press_left(self) -> None:
-        """현재 커서 위치에서 좌클릭(누름+뗌)."""
+    def press_left(self, hold: float = CLICK_HOLD_SECONDS) -> None:
+        """현재 커서 위치에서 좌클릭(누름+뗌). hold 는 누르고 있는 시간(초)."""
 
     def click(self, x: int, y: int) -> None:
         """(x, y) 로 이동한 뒤 좌클릭. 커서가 실제로 도착한 것을 확인하고 누른다."""
@@ -85,7 +91,7 @@ class PlatformAdapter(ABC):
             previous = position
             if time.monotonic() >= deadline:
                 return position
-            time.sleep(0.005)
+            time.sleep(CURSOR_POLL_SECONDS)
 
     def stop_hotkey_pressed(self) -> bool:
         """전역 중지 키가 눌렸는지. 지원 안 하면 항상 False."""
@@ -95,7 +101,10 @@ class PlatformAdapter(ABC):
         """(x, y) 지점의 창을 활성화한다.
 
         비활성 창의 버튼은 첫 클릭이 창 활성화에만 쓰이고 버려지는 앱이 있다.
-        미리 활성화해 두면 한 번의 클릭으로 눌린다. 미지원이면 False.
+        미리 활성화해 두면 한 번의 클릭으로 눌린다.
+
+        반환값은 '실제로 활성 창을 바꿨는지'다. 이미 활성 상태였거나 미지원이면
+        False 를 돌려준다. 호출자는 True 일 때만 창이 올라올 시간을 기다리면 된다.
         """
         return False
 

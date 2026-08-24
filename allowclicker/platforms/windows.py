@@ -8,7 +8,7 @@ import time
 from ctypes import wintypes
 from pathlib import Path
 
-from .base import PlatformAdapter
+from .base import CLICK_HOLD_SECONDS, PlatformAdapter
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 
@@ -177,15 +177,15 @@ class WindowsAdapter(PlatformAdapter):
         flags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
         self._send(flags, nx, ny)
 
-    def press_left(self) -> None:
+    def press_left(self, hold: float = CLICK_HOLD_SECONDS) -> None:
         self._send(MOUSEEVENTF_LEFTDOWN)
-        time.sleep(0.03)
+        if hold > 0:
+            time.sleep(hold)
         self._send(MOUSEEVENTF_LEFTUP)
 
     def click(self, x: int, y: int) -> None:
         self.move_cursor(x, y)
         self.wait_for_cursor(x, y)
-        time.sleep(0.03)  # 대상 앱이 hover 상태를 인식할 시간
         self.press_left()
 
     def stop_hotkey_pressed(self) -> bool:
@@ -204,7 +204,8 @@ class WindowsAdapter(PlatformAdapter):
                 return False
             root = user32.GetAncestor(hwnd, GA_ROOT) or hwnd
             if root == user32.GetForegroundWindow():
-                return True  # 이미 활성 상태
+                # 이미 활성 상태 -> 기다릴 필요가 없다
+                return False
             if user32.IsIconic(root):
                 user32.ShowWindow(root, SW_RESTORE)
             return bool(user32.SetForegroundWindow(root))

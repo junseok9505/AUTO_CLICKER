@@ -13,7 +13,7 @@ import ctypes.util
 import time
 from pathlib import Path
 
-from .base import PlatformAdapter
+from .base import CLICK_HOLD_SECONDS, PlatformAdapter
 
 kCGEventLeftMouseDown = 1
 kCGEventLeftMouseUp = 2
@@ -171,17 +171,17 @@ class MacAdapter(PlatformAdapter):
         self._cg.CGWarpMouseCursorPosition(CGPoint(fx, fy))
         self._post(kCGEventMouseMoved, fx, fy)
 
-    def press_left(self) -> None:
+    def press_left(self, hold: float = CLICK_HOLD_SECONDS) -> None:
         # 누름/뗌은 '현재 커서 위치'에서 발생시킨다.
         x, y = self.cursor_position()
         self._post(kCGEventLeftMouseDown, float(x), float(y))
-        time.sleep(0.03)
+        if hold > 0:
+            time.sleep(hold)
         self._post(kCGEventLeftMouseUp, float(x), float(y))
 
     def click(self, x: int, y: int) -> None:
         self.move_cursor(x, y)
         self.wait_for_cursor(x, y)
-        time.sleep(0.03)
         self.press_left()
 
     def _post(self, event_type: int, x: float, y: float) -> None:

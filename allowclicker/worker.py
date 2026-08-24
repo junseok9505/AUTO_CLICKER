@@ -35,6 +35,11 @@ PREVIEW_MIN_INTERVAL = 0.25  # 미리보기 전송 최소 간격(초)
 DISPLAY_CHECK_INTERVAL = 3.0  # 디스플레이 배치 변경 확인 간격(초)
 MAX_OFFSET = 200  # 자동 보정 한계(px). 이보다 커지면 설정이 잘못된 것이다.
 
+# 커서 이동 -> 클릭 사이의 지연. 짧을수록 반응이 빠르다.
+HOVER_SETTLE_SECONDS = 0.008  # 대상 앱이 마우스 이동을 처리할 최소 시간
+ACTIVATE_WAIT_SECONDS = 0.05  # 창을 실제로 전면에 올렸을 때만 기다린다
+CURSOR_RESTORE_DELAY = 0.02  # 클릭 후 커서를 되돌리기 전 여유
+
 
 @dataclass
 class WorkerEvent:
@@ -353,9 +358,10 @@ class ScanWorker(threading.Thread):
 
         if cfg.activate_before_click:
             # 비활성 창은 첫 클릭이 활성화에만 쓰이는 경우가 있어 미리 올려둔다.
+            # 이미 활성 창이면 False 가 오므로 기다리지 않는다.
             try:
                 if self.adapter.activate_window_at(screen_x, screen_y):
-                    time.sleep(0.08)
+                    time.sleep(ACTIVATE_WAIT_SECONDS)
             except Exception:
                 pass
 
@@ -373,7 +379,8 @@ class ScanWorker(threading.Thread):
                 screen_x, screen_y = self._to_screen(cx, cy, scale)
                 actual = self._move_and_verify(screen_x, screen_y)
 
-        time.sleep(0.03)  # hover 반영 시간
+        if HOVER_SETTLE_SECONDS > 0:
+            time.sleep(HOVER_SETTLE_SECONDS)  # 대상 앱이 hover 를 반영할 시간
         self.adapter.press_left()
         self.last_click = {"requested": (screen_x, screen_y), "actual": actual}
 
@@ -383,7 +390,7 @@ class ScanWorker(threading.Thread):
         self._emit("click", self.click_count)
 
         if origin:
-            time.sleep(0.05)
+            time.sleep(CURSOR_RESTORE_DELAY)
             try:
                 self.adapter.move_cursor(*origin)
             except Exception:
