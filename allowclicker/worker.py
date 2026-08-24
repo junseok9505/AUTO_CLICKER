@@ -23,6 +23,7 @@ from .config import AppConfig
 from .detector import (
     MIN_AUTO_SCORE,
     Detection,
+    DetectorConfig,
     calibrate_at,
     detect,
     detect_auto,
@@ -33,7 +34,8 @@ from .platforms.base import PlatformAdapter
 
 PREVIEW_MIN_INTERVAL = 0.25  # 미리보기 전송 최소 간격(초)
 DISPLAY_CHECK_INTERVAL = 3.0  # 디스플레이 배치 변경 확인 간격(초)
-MAX_OFFSET = 200  # 자동 보정 한계(px). 이보다 커지면 설정이 잘못된 것이다.
+MAX_OFFSET = 200  # 누적 보정 한계(px)
+MAX_LEARN_STEP = 60  # 한 번에 학습할 수 있는 최대 차이(px). 큰 점프는 오학습이다.
 
 # 커서 이동 -> 클릭 사이의 지연. 짧을수록 반응이 빠르다.
 HOVER_SETTLE_SECONDS = 0.008  # 대상 앱이 마우스 이동을 처리할 최소 시간
@@ -273,12 +275,17 @@ class ScanWorker(threading.Thread):
         return target is not None and now - last_preview >= 0.1
 
     def _auto_calibrate(self, image: np.ndarray) -> bool:
-        """영역에서 버튼처럼 보이는 것을 스스로 찾아 인식 기준을 학습한다."""
-        candidates = detect_auto(image, self.config.detector)
+        """영역에서 버튼처럼 보이는 것을 스스로 찾아 인식 기준을 학습한다.
+
+        후보 탐색에는 저장된 기준이 아니라 기본값을 쓴다. 저장된 값이 한 번
+        잘못 좁혀지면(예: 엉뚱한 것에 학습) 재시작해도 아무것도 못 찾는
+        상태가 굳어버리기 때문이다.
+        """
+        candidates = detect_auto(image, DetectorConfig())
         if not candidates:
             return False
         best = candidates[0]
-        if best.score < MIN_AUTO_SCORE:
+        if best.score < MIN_AUTO_SCORE:  # noqa: SIM102 - 로그를 위해 분리
             # 버튼이라고 확신하기 어려운 것(긴 막대, 글자 없는 색 블록 등)에
             # 잘못 학습하면 엉뚱한 곳을 클릭한다. 더 나은 후보를 기다린다.
             if not self._weak_candidate_logged:
@@ -330,7 +337,10 @@ class ScanWorker(threading.Thread):
         if (new_x, new_y) == (self.offset[0], self.offset[1]):
             return False
         self.offset = [new_x, new_y]
-        self._log(f"좌표 자동 보정: {why} -> 누적 보정 ({new_x:+d}, {new_y:+d})")
+        self._log(
+            f"좌표 자동 보정: {why} -> 누적 보정 ({new_x:+d}, {new_y:+d}) "
+            "[이번 실행에만 적용]"
+        )
         self._emit("offset", (new_x, new_y))
         return True
 
@@ -366,18 +376,14 @@ class ScanWorker(threading.Thread):
                 pass
 
         actual = self._move_and_verify(screen_x, screen_y)
-        # 좌표가 어긋났으면 보정하고 한 번만 다시 맞춘다.
         if (
             cfg.auto_offset
             and actual is not None
             and (abs(actual[0] - screen_x) > 1 or abs(actual[1] - screen_y) > 1)
         ):
-            dx, dy = screen_x - actual[0], screen_y - actual[1]
-            if self._apply_offset(
-                dx, dy, f"커서가 {(screen_x, screen_y)} 대신 {actual} 에 도착"
-            ):
-                screen_x, screen_y = self._to_screen(cx, cy, scale)
-                actual = self._move_and_verify(screen_x, screen_y)
+            screen_x, screen_y, actual = self._confirm_and_correct(
+                cx, cy, scale, screen_x, screen_y, actual
+            )
 
         if HOVER_SETTLE_SECONDS > 0:
             time.sleep(HOVER_SETTLE_SECONDS)  # 대상 앱이 hover 를 반영할 시간
@@ -395,6 +401,54 @@ class ScanWorker(threading.Thread):
                 self.adapter.move_cursor(*origin)
             except Exception:
                 pass
+
+    def _confirm_and_correct(
+        self,
+        cx: float,
+        cy: float,
+        scale: float,
+        screen_x: int,
+        screen_y: int,
+        first: tuple[int, int],
+    ) -> tuple[int, int, tuple[int, int] | None]:
+        """커서가 요청 좌표에 없을 때, 확인 후에만 보정한다.
+
+        한 번 어긋난 것만 보고 배우면 안 된다. 그 순간 사용자가 마우스를 움직였을
+        수도 있고, 그러면 손이 옮긴 위치를 '좌표계가 어긋났다'고 오해해서 이후
+        모든 클릭이 엉뚱한 곳으로 간다. 그래서 같은 차이가 다시 재현될 때만
+        좌표계 문제로 판단한다.
+        """
+        second = self._move_and_verify(screen_x, screen_y)
+        if second is None:
+            return screen_x, screen_y, first
+
+        if second == (screen_x, screen_y):
+            self._log(
+                f"커서가 잠깐 {first} 에 있었지만 다시 옮기니 정상입니다. "
+                "(마우스를 건드린 것으로 보고 보정하지 않습니다)"
+            )
+            return screen_x, screen_y, second
+
+        if abs(second[0] - first[0]) > 2 or abs(second[1] - first[1]) > 2:
+            self._log(
+                f"커서 위치가 계속 달라집니다({first} -> {second}). "
+                "마우스를 쓰는 중으로 보여 보정하지 않습니다."
+            )
+            return screen_x, screen_y, second
+
+        dx, dy = screen_x - second[0], screen_y - second[1]
+        if max(abs(dx), abs(dy)) > MAX_LEARN_STEP:
+            self._log(
+                f"커서가 요청 좌표에서 ({dx:+d}, {dy:+d}) 만큼 떨어졌습니다. "
+                f"{MAX_LEARN_STEP}px 를 넘어 보정하지 않습니다. "
+                "다른 프로그램이 마우스를 잡고 있는지 확인하세요."
+            )
+            return screen_x, screen_y, second
+
+        if self._apply_offset(dx, dy, f"같은 차이가 두 번 확인됨 (요청 대비 {second})"):
+            new_x, new_y = self._to_screen(cx, cy, scale)
+            return new_x, new_y, self._move_and_verify(new_x, new_y)
+        return screen_x, screen_y, second
 
     def _move_and_verify(self, x: int, y: int) -> tuple[int, int] | None:
         """커서를 옮기고, 실제로 도착한 좌표를 확인해서 돌려준다."""

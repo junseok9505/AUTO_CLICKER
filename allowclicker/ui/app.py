@@ -137,6 +137,8 @@ class AllowClickerApp:
         self.auto_calib_var = tk.BooleanVar(value=cfg.auto_calibrate)
         self.auto_offset_var = tk.BooleanVar(value=cfg.auto_offset)
         self.offset_var = tk.StringVar()
+        # 워커가 학습한 보정값 (저장하지 않고 이번 실행에만 사용)
+        self.session_offset: tuple[int, int] | None = None
         self.monitor_var = tk.StringVar()
         self.monitors: list[dict] = []  # mss 좌표계 기준 모니터 목록
         self.template_var = tk.StringVar()
@@ -332,10 +334,15 @@ class AllowClickerApp:
         ttk.Button(control, text="설정 저장", command=self._save).grid(
             row=0, column=2, padx=4
         )
-        ttk.Label(control, textvariable=self.status_var, width=34).grid(
-            row=0, column=3, padx=8, sticky="w"
+        self.reset_all_btn = ttk.Button(
+            control, text="전체 초기화", command=self._reset_all
         )
-        ttk.Label(control, textvariable=self.clicks_var).grid(row=0, column=4)
+        self.reset_all_btn.grid(row=0, column=3, padx=4)
+        self._settings_widgets.append((self.reset_all_btn, "normal"))
+        ttk.Label(control, textvariable=self.status_var, width=28).grid(
+            row=0, column=4, padx=8, sticky="w"
+        )
+        ttk.Label(control, textvariable=self.clicks_var).grid(row=0, column=5)
 
         hotkey = self.adapter.stop_hotkey_label
         if hotkey:
@@ -383,6 +390,10 @@ class AllowClickerApp:
         )
 
     def _update_offset_label(self) -> None:
+        if self.session_offset is not None:
+            dx, dy = self.session_offset
+            self.offset_var.set(f"보정 {dx:+d}, {dy:+d} (이번 실행만)")
+            return
         dx, dy = self.cfg.click_offset_x, self.cfg.click_offset_y
         self.offset_var.set("보정 없음" if (dx, dy) == (0, 0) else f"보정 {dx:+d}, {dy:+d}")
 
@@ -836,11 +847,68 @@ class AllowClickerApp:
         self._save(quiet=True)
         self._test_once(quiet=True)
 
+    def _reset_all(self) -> None:
+        """모든 설정을 처음 상태로 되돌린다 (설정 파일까지 갱신)."""
+        if not messagebox.askokcancel(
+            "전체 초기화",
+            "감시 영역, 버튼 견본, 인식 기준, 클릭 보정, 모니터 선택,\n"
+            "동작 옵션을 모두 처음 상태로 되돌립니다.\n\n계속할까요?",
+            icon="warning",
+        ):
+            return
+        if self.worker:
+            self.worker.stop()
+            self.worker.join(timeout=2.0)
+            self.worker = None
+            self.start_btn.configure(state="normal")
+            self.stop_btn.configure(state="disabled")
+            self.test_btn.configure(state="normal")
+            self._set_settings_enabled(True)
+            self.status_var.set("정지")
+
+        self.cfg = AppConfig()
+        self.region = None
+        self.session_offset = None
+        self.clicks_var.set("클릭 0회")
+        self._config_to_ui()
+        self.preview.delete("all")
+        self._photo = None
+        try:
+            path = save_config(self.config_dir, self.cfg)
+            self._log(f"전체 초기화 완료: {path}")
+        except OSError as exc:
+            self._log(f"전체 초기화는 됐지만 저장에 실패했습니다: {exc}")
+        self._log("모니터 선택과 '버튼 영역 지정'부터 다시 하면 됩니다.")
+
+    def _config_to_ui(self) -> None:
+        """self.cfg 의 모든 값을 화면 입력칸에 반영한다."""
+        cfg = self.cfg
+        self.interval_var.set(f"{cfg.interval:g}")
+        self.cooldown_var.set(f"{cfg.cooldown:g}")
+        self.confirm_var.set(str(cfg.confirm_frames))
+        self.max_clicks_var.set(str(cfg.max_clicks))
+        self.retries_var.set(str(cfg.max_retries))
+        self.timeout_var.set(f"{cfg.retry_timeout:g}")
+        self.dry_var.set(cfg.dry_run)
+        self.restore_var.set(cfg.restore_cursor)
+        self.activate_var.set(cfg.activate_before_click)
+        self.auto_calib_var.set(cfg.auto_calibrate)
+        self.auto_offset_var.set(cfg.auto_offset)
+        self.policy_var.set(cfg.click_policy)
+        self._detector_to_ui()
+        self._update_region_label()
+        self._update_template_label()
+        self._update_offset_label()
+        if self.monitor_combo.cget("values"):
+            index = min(cfg.monitor_index, len(self.monitor_combo.cget("values")) - 1)
+            self.monitor_combo.current(max(0, index))
+
     def _reset_detector(self) -> None:
         """인식 기준과 좌표 보정을 기본값으로 되돌린다 (튜닝이 꼬였을 때)."""
         self.cfg.detector = DetectorConfig()
         self.cfg.click_offset_x = 0
         self.cfg.click_offset_y = 0
+        self.session_offset = None
         self._detector_to_ui()
         self._update_offset_label()
         self._log("인식 기준과 클릭 보정을 기본값으로 되돌렸습니다.")
@@ -1025,8 +1093,10 @@ class AllowClickerApp:
                 elif event.kind == "error":
                     self._log(f"오류: {event.payload}")
                 elif event.kind == "offset":
-                    # 워커가 학습한 클릭 보정값을 설정에 반영해 다음 실행에도 쓴다
-                    self.cfg.click_offset_x, self.cfg.click_offset_y = event.payload
+                    # 학습한 보정값은 이번 실행에만 쓴다. 설정 파일에 저장하면
+                    # 한 번 잘못 학습한 값이 재시작 후에도 계속 클릭 위치를
+                    # 어긋나게 만든다. 매 클릭마다 다시 확인하므로 저장이 필요 없다.
+                    self.session_offset = tuple(event.payload)
                     self._update_offset_label()
                 elif event.kind == "calibrated":
                     # 워커가 스스로 학습한 인식 기준을 UI 에 반영
