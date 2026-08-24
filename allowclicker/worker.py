@@ -63,6 +63,9 @@ class ScanWorker(threading.Thread):
         self.last_click: dict | None = None
         self.calibrated = False
         self._weak_candidate_logged = False
+        # 사용자가 지정한 버튼 견본이 있으면 그것이 최우선 기준이다.
+        self.template = config.template
+        self.policy = "match" if self.template is not None else config.click_policy
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -97,9 +100,16 @@ class ScanWorker(threading.Thread):
         if self.offset != [0, 0]:
             self._log(f"이전에 학습한 클릭 보정 적용: {tuple(self.offset)}")
 
+        if self.template is not None:
+            # 지정된 버튼 견본이 있으면 자동 학습 없이 그 기준으로 바로 감시한다.
+            self.calibrated = True
+            self._log(
+                f"지정된 버튼 견본 사용: {self.template.describe()} "
+                f"(모양 일치도 {cfg.detector.min_shape_match:.2f} 이상)"
+            )
         # 시작할 때 스스로 캘리브레이션한다. 지금 화면에 버튼이 없으면
         # 자동 탐지 모드로 돌면서 버튼이 나타나는 순간 학습한다.
-        if cfg.auto_calibrate:
+        elif cfg.auto_calibrate:
             try:
                 image, _scale = self.capture.grab(self.region)
                 if self._auto_calibrate(image):
@@ -137,8 +147,12 @@ class ScanWorker(threading.Thread):
                         self.calibrated = True
                     else:
                         self._emit("status", "자동 탐지 중 (버튼 대기)")
-                detections = detect(image, cfg.detector) if self.calibrated else []
-                target = pick_target(detections, cfg.click_policy)
+                detections = (
+                    detect(image, cfg.detector, template=self.template)
+                    if self.calibrated
+                    else []
+                )
+                target = pick_target(detections, self.policy)
 
                 if target is None:
                     if streak:
@@ -168,8 +182,12 @@ class ScanWorker(threading.Thread):
                     self._emit(
                         "status",
                         f"감지: {target.width}x{target.height} "
-                        f"채움 {target.fill:.2f} 글자 {target.text_ratio:.2f} "
-                        f"({streak}/{cfg.confirm_frames})",
+                        + (
+                            f"견본일치 {target.match:.2f} "
+                            if target.match > -2.0
+                            else f"채움 {target.fill:.2f} "
+                        )
+                        + f"({streak}/{cfg.confirm_frames})",
                     )
 
                     ready = streak >= max(1, cfg.confirm_frames)

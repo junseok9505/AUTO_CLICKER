@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import asdict, dataclass, field, replace
 
 import numpy as np
@@ -43,6 +44,8 @@ class DetectorConfig:
     max_text_ratio: float = 0.50
     text_val_min: float = 0.70
     text_sat_max: float = 0.45
+    # 버튼 견본(템플릿)이 있을 때 요구하는 모양 일치도 (-1~1). 밝기 변화에 강한 ZNCC.
+    min_shape_match: float = 0.45
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -74,6 +77,7 @@ class Detection:
     text_ratio: float
     score: float
     hue: float = -1.0  # 자동 탐지에서 추정한 색상(°). -1 = 미측정
+    match: float = -2.0  # 견본과의 모양 일치도. -2 = 견본 없음
 
     @property
     def center(self) -> tuple[float, float]:
@@ -205,6 +209,88 @@ class DetectStats:
         return lines
 
 
+THUMB_WIDTH = 40
+THUMB_HEIGHT = 16
+
+
+def _resize_nearest(image: np.ndarray, out_w: int, out_h: int) -> np.ndarray:
+    """의존성 없이 최근접 이웃으로 크기 변경."""
+    height, width = image.shape[:2]
+    ys = np.clip((np.arange(out_h) * height) // max(1, out_h), 0, height - 1)
+    xs = np.clip((np.arange(out_w) * width) // max(1, out_w), 0, width - 1)
+    return image[ys][:, xs]
+
+
+@dataclass
+class ButtonTemplate:
+    """사용자가 지정한 '눌러야 하는 버튼'의 견본.
+
+    원래 크기와, 크기를 정규화한 작은 썸네일을 갖고 있다. 썸네일을 밝기에 둔감한
+    방식(ZNCC)으로 비교하므로, hover 로 색이 조금 밝아져도 같은 버튼으로 인식하고
+    글자 모양이 다른 버튼('Always allow' 등)은 걸러낸다.
+    """
+
+    width: int
+    height: int
+    thumb: np.ndarray  # (THUMB_HEIGHT, THUMB_WIDTH, 3) uint8
+
+    def to_dict(self) -> dict:
+        return {
+            "width": int(self.width),
+            "height": int(self.height),
+            "thumb_w": int(self.thumb.shape[1]),
+            "thumb_h": int(self.thumb.shape[0]),
+            "thumb": base64.b64encode(
+                np.ascontiguousarray(self.thumb, dtype=np.uint8).tobytes()
+            ).decode("ascii"),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "ButtonTemplate | None":
+        if not data:
+            return None
+        try:
+            thumb_w = int(data["thumb_w"])
+            thumb_h = int(data["thumb_h"])
+            raw = base64.b64decode(data["thumb"])
+            if len(raw) != thumb_w * thumb_h * 3:
+                return None
+            thumb = np.frombuffer(raw, dtype=np.uint8).reshape(thumb_h, thumb_w, 3)
+            return cls(int(data["width"]), int(data["height"]), thumb.copy())
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def describe(self) -> str:
+        return f"견본 {self.width}x{self.height}"
+
+
+def make_template(crop: np.ndarray) -> ButtonTemplate | None:
+    """버튼 영역 이미지로 견본을 만든다."""
+    if crop.size == 0 or crop.shape[0] < 3 or crop.shape[1] < 3:
+        return None
+    thumb = _resize_nearest(crop, THUMB_WIDTH, THUMB_HEIGHT)
+    return ButtonTemplate(
+        width=int(crop.shape[1]), height=int(crop.shape[0]), thumb=thumb.copy()
+    )
+
+
+def match_score(crop: np.ndarray, template: ButtonTemplate) -> float:
+    """견본과의 일치도 (-1~1). 밝기/대비 변화에 둔감한 정규 상호상관."""
+    if crop.size == 0:
+        return -1.0
+    thumb = _resize_nearest(crop, template.thumb.shape[1], template.thumb.shape[0])
+    a = thumb.astype(np.float32).mean(axis=2)
+    b = template.thumb.astype(np.float32).mean(axis=2)
+    a = a - a.mean()
+    b = b - b.mean()
+    da = float(np.sqrt((a * a).mean()))
+    db = float(np.sqrt((b * b).mean()))
+    if da < 1e-6 or db < 1e-6:
+        # 둘 중 하나가 완전 단색이면 무늬로 비교할 수 없다.
+        return 1.0 if da < 1e-6 and db < 1e-6 else 0.0
+    return float(np.clip((a * b).mean() / (da * db), -1.0, 1.0))
+
+
 def component_at(
     mask: np.ndarray, px: int, py: int
 ) -> tuple[int, int, int, int, int] | None:
@@ -249,11 +335,15 @@ def component_at(
 
 
 def detect(
-    rgb: np.ndarray, config: DetectorConfig, stats: DetectStats | None = None
+    rgb: np.ndarray,
+    config: DetectorConfig,
+    stats: DetectStats | None = None,
+    template: ButtonTemplate | None = None,
 ) -> list[Detection]:
     """이미지에서 버튼 후보를 찾아 점수 내림차순으로 반환.
 
     stats 를 넘기면 탈락 이유를 기록한다(진단용).
+    template 을 넘기면 모양까지 비교해서 다른 버튼을 걸러낸다.
     """
     if rgb.size == 0:
         return []
@@ -324,6 +414,17 @@ def detect(
             )
             continue
 
+        match = -2.0
+        if template is not None:
+            match = match_score(rgb[y0:y1, x0:x1], template)
+            info["match"] = match
+            if match < config.min_shape_match:
+                reject(
+                    f"견본 일치도 {match:.2f} < {config.min_shape_match:.2f} "
+                    "(다른 버튼으로 보임)"
+                )
+                continue
+
         text_score = min(text_ratio / 0.12, 1.0)
         score = fill * 0.6 + text_score * 0.4
         results.append(
@@ -335,6 +436,7 @@ def detect(
                 fill=round(float(fill), 3),
                 text_ratio=round(float(text_ratio), 3),
                 score=round(float(score), 3),
+                match=round(float(match), 3),
             )
         )
 
@@ -515,11 +617,17 @@ def pick_target(
 ) -> Detection | None:
     """클릭할 후보 하나를 고른다.
 
+    match   : 견본과 가장 비슷한 것 (버튼 견본이 있을 때 기본)
     leftmost: 같은 줄(row_tolerance 이내)에서 가장 왼쪽 -> Kiro 대화상자의 'Allow'
     score   : 점수가 가장 높은 것
     """
     if not detections:
         return None
+    if policy == "match" and any(d.match > -2.0 for d in detections):
+        best = max(d.match for d in detections)
+        # 일치도가 비슷하면(0.03 이내) 더 왼쪽에 있는 것을 고른다.
+        close = [d for d in detections if best - d.match <= 0.03]
+        return min(close, key=lambda d: (d.y // max(1, row_tolerance), d.x))
     if policy == "score":
         return detections[0]
     top = min(d.y for d in detections)
@@ -555,14 +663,67 @@ class Calibration:
         )
 
 
+def dominant_color(
+    rgb: np.ndarray, sat_min: float = 0.18, val_min: float = 0.15
+) -> tuple[float, float, float] | None:
+    """영역에서 가장 많이 쓰인 '유채색'을 (색상, 채도, 명도) 로 돌려준다.
+
+    버튼 중앙을 클릭하면 흰 글자 픽셀을 짚을 확률이 높다. 한 픽셀 색을 그대로
+    쓰면 글자색을 버튼색으로 착각하므로, 주변에서 가장 흔한 색을 대표색으로 쓴다.
+    """
+    if rgb.size == 0:
+        return None
+    hue, sat, val = rgb_to_hsv(rgb)
+    colored = (sat >= sat_min) & (val >= val_min)
+    if int(colored.sum()) < 8:
+        return None
+    buckets = np.clip((hue[colored] / 10.0).astype(np.int32), 0, 35)
+    dominant = int(np.bincount(buckets, minlength=36).argmax())
+    selected = colored & (np.clip((hue / 10.0).astype(np.int32), 0, 35) == dominant)
+    hues = hue[selected]
+    radians = np.deg2rad(hues)
+    center = float(
+        np.rad2deg(np.arctan2(np.sin(radians).mean(), np.cos(radians).mean())) % 360.0
+    )
+    return center, float(np.median(sat[selected])), float(np.median(val[selected]))
+
+
+def _similar_mask(
+    hue: np.ndarray, sat: np.ndarray, val: np.ndarray, ref: tuple[float, float, float]
+) -> np.ndarray:
+    h0, s0, v0 = ref
+    return (
+        (hue_distance(hue, h0) <= 25.0)
+        & (np.abs(sat - s0) <= 0.35)
+        & (np.abs(val - v0) <= 0.35)
+    )
+
+
+def _nearest_true(
+    mask: np.ndarray, px: int, py: int, radius: int = 24
+) -> tuple[int, int] | None:
+    """(px, py) 에서 가장 가까운 True 픽셀 (글자 위를 클릭했을 때 대비)."""
+    height, width = mask.shape
+    x0, x1 = max(0, px - radius), min(width, px + radius + 1)
+    y0, y1 = max(0, py - radius), min(height, py + radius + 1)
+    window = mask[y0:y1, x0:x1]
+    ys, xs = np.nonzero(window)
+    if ys.size == 0:
+        return None
+    dx = xs + x0 - px
+    dy = ys + y0 - py
+    index = int(np.argmin(dx * dx + dy * dy))
+    return int(xs[index] + x0), int(ys[index] + y0)
+
+
 def calibrate_at(
     rgb: np.ndarray,
     point: tuple[int, int],
     base: DetectorConfig | None = None,
 ) -> Calibration | None:
-    """crop 이미지에서 (point) 픽셀이 속한 버튼을 측정해 설정을 만든다.
+    """crop 이미지에서 (point) 주변의 버튼을 측정해 설정을 만든다.
 
-    사용자가 실제 버튼을 클릭하면 그 색과 같은 덩어리를 찾아
+    사용자가 실제 버튼을 클릭하면 주변 대표색으로 같은 덩어리를 찾아
     크기/채움율/글자비율/색 분포를 직접 재서 파라미터를 정한다.
     추측이 아니라 측정값이라 테마·배율·해상도가 달라도 맞는다.
     """
@@ -574,18 +735,20 @@ def calibrate_at(
         return None
 
     hue, sat, val = rgb_to_hsv(rgb)
-    h0, s0, v0 = float(hue[py, px]), float(sat[py, px]), float(val[py, px])
+    # 클릭 지점 주변(글자를 짚었을 수도 있으므로)에서 대표색을 뽑는다.
+    radius = 24
+    wx0, wx1 = max(0, px - radius), min(width, px + radius + 1)
+    wy0, wy1 = max(0, py - radius), min(height, py + radius + 1)
+    reference = dominant_color(rgb[wy0:wy1, wx0:wx1])
+    if reference is None:
+        reference = (float(hue[py, px]), float(sat[py, px]), float(val[py, px]))
 
-    # 클릭한 색 주변을 넉넉하게 잡아 버튼 전체가 한 덩어리가 되게 한다.
-    similar = (
-        (hue_distance(hue, h0) <= 25.0)
-        & (np.abs(sat - s0) <= 0.35)
-        & (np.abs(val - v0) <= 0.35)
-    )
-    if not similar[py, px]:
+    similar = _similar_mask(hue, sat, val, reference)
+    seed = (px, py) if similar[py, px] else _nearest_true(similar, px, py, radius)
+    if seed is None:
         return None
 
-    blob = component_at(similar, px, py)
+    blob = component_at(similar, seed[0], seed[1])
     if blob is None:
         return None
 
@@ -653,6 +816,78 @@ def calibrate_at(
         fill=round(float(fill), 3),
         text_ratio=round(float(text_ratio), 4),
         hue=round(center, 1),
+        sat=round(float(np.median(sats)), 3),
+        val=round(float(np.median(vals)), 3),
+        warnings=warnings,
+    )
+
+
+def calibrate_from_rect(
+    crop: np.ndarray, base: DetectorConfig | None = None
+) -> Calibration | None:
+    """사용자가 드래그로 감싼 버튼 영역 자체를 측정해 설정을 만든다.
+
+    사용자가 경계를 직접 알려준 경우라 flood fill 로 크기를 추정할 필요가 없다.
+    그 영역의 대표색과 실제 크기를 그대로 기준으로 쓴다.
+    """
+    if crop.size == 0 or crop.shape[0] < 3 or crop.shape[1] < 3:
+        return None
+    reference = dominant_color(crop)
+    if reference is None:
+        return None
+
+    hue, sat, val = rgb_to_hsv(crop)
+    similar = _similar_mask(hue, sat, val, reference)
+    height, width = crop.shape[:2]
+    fill = float(similar.mean())
+
+    cfg = replace(base) if base is not None else DetectorConfig()
+    hues = hue[similar]
+    sats = sat[similar]
+    vals = val[similar]
+    spread = float(np.percentile(hue_distance(hues, reference[0]), 95))
+    cfg.hue_center = round(reference[0], 1)
+    cfg.hue_tolerance = round(min(60.0, max(12.0, spread + 8.0)), 1)
+    cfg.sat_min = round(max(0.05, float(np.percentile(sats, 5)) - 0.12), 3)
+    cfg.val_min = round(max(0.05, float(np.percentile(vals, 5)) - 0.12), 3)
+
+    bright = (val >= cfg.text_val_min) & (sat <= cfg.text_sat_max)
+    text_ratio = float(bright.mean())
+
+    cfg.min_width = max(6, int(width * 0.6))
+    cfg.max_width = int(width * 2.0) + 8
+    cfg.min_height = max(4, int(height * 0.6))
+    cfg.max_height = int(height * 2.0) + 8
+    aspect = width / float(height)
+    cfg.min_aspect = round(max(0.5, aspect * 0.55), 2)
+    cfg.max_aspect = round(aspect * 2.0 + 1.0, 2)
+    # 지정 영역에 여백이 조금 섞이는 것은 정상이므로 채움율 기준을 느슨하게 둔다.
+    cfg.min_fill = round(max(0.30, fill * 0.75), 3)
+    if text_ratio >= 0.005:
+        cfg.require_text = True
+        cfg.min_text_ratio = round(max(0.002, text_ratio * 0.4), 4)
+        cfg.max_text_ratio = round(min(0.70, text_ratio * 2.5 + 0.05), 4)
+    else:
+        cfg.require_text = False
+
+    warnings: list[str] = []
+    if fill < 0.55:
+        warnings.append(
+            f"지정한 영역에서 버튼 색이 {fill * 100:.0f}% 뿐입니다. "
+            "버튼 테두리에 더 맞게 다시 지정하면 정확해집니다."
+        )
+    if not cfg.require_text:
+        warnings.append("영역 안에서 밝은 글자를 찾지 못해 글자 조건을 껐습니다.")
+
+    return Calibration(
+        config=cfg,
+        x=0,
+        y=0,
+        width=int(width),
+        height=int(height),
+        fill=round(fill, 3),
+        text_ratio=round(text_ratio, 4),
+        hue=round(reference[0], 1),
         sat=round(float(np.median(sats)), 3),
         val=round(float(np.median(vals)), 3),
         warnings=warnings,

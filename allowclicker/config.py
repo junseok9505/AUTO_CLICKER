@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .detector import DetectorConfig
+from .detector import ButtonTemplate, DetectorConfig
 from .geometry import Region
 
 CONFIG_FILENAME = "config.json"
@@ -14,7 +14,9 @@ CONFIG_FILENAME = "config.json"
 
 @dataclass
 class AppConfig:
-    region: Region | None = None
+    region: Region | None = None  # 감시 영역
+    button_rect: Region | None = None  # 사용자가 지정한 '눌러야 하는 버튼' 영역
+    template: ButtonTemplate | None = None  # 그 버튼의 견본 이미지
     detector: DetectorConfig = field(default_factory=DetectorConfig)
     interval: float = 0.4  # 화면 검사 주기(초)
     cooldown: float = 1.5  # 클릭 후 재클릭 금지 시간(초)
@@ -35,6 +37,8 @@ class AppConfig:
     def to_dict(self) -> dict:
         return {
             "region": self.region.to_dict() if self.region else None,
+            "button_rect": self.button_rect.to_dict() if self.button_rect else None,
+            "template": self.template.to_dict() if self.template else None,
             "detector": self.detector.to_dict(),
             "interval": self.interval,
             "cooldown": self.cooldown,
@@ -59,6 +63,8 @@ class AppConfig:
         if not data:
             return cfg
         cfg.region = Region.from_dict(data.get("region"))
+        cfg.button_rect = Region.from_dict(data.get("button_rect"))
+        cfg.template = ButtonTemplate.from_dict(data.get("template"))
         cfg.detector = DetectorConfig.from_dict(data.get("detector"))
         for key in (
             "interval",

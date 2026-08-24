@@ -9,7 +9,8 @@ from __future__ import annotations
 import queue
 import time
 import tkinter as tk
-from tkinter import messagebox, ttk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 import numpy as np
@@ -21,8 +22,10 @@ from ..detector import (
     DetectorConfig,
     DetectStats,
     calibrate_at,
+    calibrate_from_rect,
     detect,
     detect_auto,
+    make_template,
     pick_target,
 )
 from ..geometry import Region
@@ -33,6 +36,29 @@ from .overlay import pick_screen_point, select_region
 PREVIEW_WIDTH = 460
 PREVIEW_HEIGHT = 200
 MAX_LOG_LINES = 400
+
+
+def photo_to_numpy(photo: tk.PhotoImage) -> np.ndarray:
+    """tkinter 로 읽은 이미지를 RGB 배열로 (Pillow 없이).
+
+    Tk 8.6 은 PNG/GIF 를 읽을 수 있다. 픽셀은 한 개씩 읽어야 하지만
+    버튼 크기(수천 픽셀)라 문제되지 않는다.
+    """
+    width, height = photo.width(), photo.height()
+    if width <= 0 or height <= 0:
+        raise ValueError("빈 이미지입니다.")
+    if width * height > 400_000:
+        raise ValueError("이미지가 너무 큽니다. 버튼만 잘라낸 이미지를 사용하세요.")
+    rows = []
+    for y in range(height):
+        row = []
+        for x in range(width):
+            value = photo.get(x, y)
+            if isinstance(value, str):
+                value = value.split()
+            row.append([int(value[0]), int(value[1]), int(value[2])])
+        rows.append(row)
+    return np.array(rows, dtype=np.uint8)
 
 
 def numpy_to_photo(image: np.ndarray) -> tk.PhotoImage:
@@ -112,6 +138,8 @@ class AllowClickerApp:
         self.offset_var = tk.StringVar()
         self.monitor_var = tk.StringVar()
         self.monitors: list[dict] = []  # mss 좌표계 기준 모니터 목록
+        self.template_var = tk.StringVar()
+        self.match_var = tk.StringVar(value=f"{det.min_shape_match:g}")
 
         self.hue_var = tk.StringVar(value=f"{det.hue_center:g}")
         self.tol_var = tk.StringVar(value=f"{det.hue_tolerance:g}")
@@ -186,10 +214,32 @@ class AllowClickerApp:
         self._settings_widgets += [(calib, "normal"), (reset, "normal")]
         self._entry(color, "색상(°)", self.hue_var, 0, 3)
         self._entry(color, "허용(±°)", self.tol_var, 0, 4)
+
+        # 눌러야 하는 버튼을 직접 지정 (견본 등록)
+        ttk.Label(color, textvariable=self.template_var, width=30).grid(
+            row=1, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 4)
+        )
+        pick_btn = ttk.Button(
+            color, text="버튼 영역 지정", command=self._select_button_rect
+        )
+        pick_btn.grid(row=1, column=2, padx=4, pady=(0, 4))
+        from_file = ttk.Button(
+            color, text="이미지로 지정", command=self._template_from_file
+        )
+        from_file.grid(row=1, column=3, padx=4, pady=(0, 4))
+        clear_btn = ttk.Button(color, text="견본 지우기", command=self._clear_template)
+        clear_btn.grid(row=1, column=4, padx=(4, 8), pady=(0, 4))
+        self._entry(color, "일치도 최소", self.match_var, 1, 3)
+        self._settings_widgets += [
+            (pick_btn, "normal"),
+            (from_file, "normal"),
+            (clear_btn, "normal"),
+        ]
         ttk.Label(
             color,
-            text="인식이 안 되면 캘리브레이션을 누르고 실제 Allow 버튼 중앙을 클릭하세요.",
-        ).grid(row=1, column=0, columnspan=8, sticky="w", padx=8, pady=(0, 6))
+            text="'버튼 영역 지정'으로 눌러야 하는 버튼을 감싸면 그 모양까지 비교해서 "
+            "비슷한 다른 버튼을 걸러냅니다.",
+        ).grid(row=2, column=0, columnspan=10, sticky="w", padx=8, pady=(0, 6))
 
         # --- 3. 동작
         run = ttk.LabelFrame(root, text="3. 동작 설정")
@@ -262,7 +312,7 @@ class AllowClickerApp:
         policy = ttk.Combobox(
             adv,
             textvariable=self.policy_var,
-            values=("leftmost", "score"),
+            values=("match", "leftmost", "score"),
             state="readonly",
             width=9,
         )
@@ -312,6 +362,7 @@ class AllowClickerApp:
         self._update_region_label()
         self._update_swatch()
         self._update_offset_label()
+        self._update_template_label()
         self._refresh_monitors(quiet=True)
 
     # -------------------------------------------------------------- 헬퍼/상태
@@ -352,7 +403,7 @@ class AllowClickerApp:
                 pass
 
     # ------------------------------------------------------------ 설정 수집
-    def _collect(self) -> bool:
+    def _collect(self, silent: bool = False) -> bool:
         """UI 값을 self.cfg 로 옮긴다. 형식이 틀리면 False."""
         try:
             cfg, det = self.cfg, self.cfg.detector
@@ -381,21 +432,30 @@ class AllowClickerApp:
             det.min_height = int(self.min_h_var.get())
             det.max_height = int(self.max_h_var.get())
             det.require_text = bool(self.require_text_var.get())
+            det.min_shape_match = _clamp(float(self.match_var.get()), -1.0, 1.0)
         except (TypeError, ValueError) as exc:
-            messagebox.showerror("설정 오류", f"숫자 입력을 확인하세요.\n{exc}")
+            if not silent:
+                messagebox.showerror("설정 오류", f"숫자 입력을 확인하세요.\n{exc}")
             return False
 
         if det.min_width > det.max_width or det.min_height > det.max_height:
-            messagebox.showerror("설정 오류", "크기 최소값이 최대값보다 큽니다.")
+            if not silent:
+                messagebox.showerror("설정 오류", "크기 최소값이 최대값보다 큽니다.")
             return False
         self._update_swatch()
         return True
 
-    def _save(self) -> None:
-        if not self._collect():
+    def _save(self, quiet: bool = False) -> None:
+        """설정을 즉시 파일에 저장한다. 다음 실행 때 그대로 복원된다."""
+        if not self._collect(silent=quiet):
             return
-        path = save_config(self.config_dir, self.cfg)
-        self._log(f"설정을 저장했습니다: {path}")
+        try:
+            path = save_config(self.config_dir, self.cfg)
+        except OSError as exc:
+            self._log(f"설정 저장 실패: {exc}")
+            return
+        if not quiet:
+            self._log(f"설정을 저장했습니다: {path}")
 
     # -------------------------------------------------------------- 모니터
     def _refresh_monitors(self, quiet: bool = False) -> None:
@@ -457,6 +517,7 @@ class AllowClickerApp:
         self.region = Region(mon["left"], mon["top"], mon["width"], mon["height"])
         self.cfg.region = self.region
         self._update_region_label()
+        self._save(quiet=True)
         self._log(f"모니터 전체를 감시 영역으로 설정: {self.region}")
         if self._window_overlaps_region():
             self._log(
@@ -509,7 +570,151 @@ class AllowClickerApp:
         self.cfg.region = region
         self._update_region_label()
         self._log(f"영역 선택: {region}")
+        self._save(quiet=True)  # 바로 저장해서 다음 실행에도 유지
         self._test_once(quiet=True)
+
+    # ------------------------------------------------- 버튼 견본(클릭 대상) 지정
+    def _update_template_label(self) -> None:
+        template = self.cfg.template
+        if template is None:
+            self.template_var.set("버튼 견본: 없음 (색/모양 자동 판단)")
+        else:
+            where = f" @ {self.cfg.button_rect}" if self.cfg.button_rect else ""
+            self.template_var.set(f"버튼 견본: {template.width}x{template.height}{where}")
+
+    def _select_button_rect(self) -> None:
+        """눌러야 하는 버튼을 드래그로 감싸서 견본으로 등록한다."""
+        messagebox.showinfo(
+            "버튼 영역 지정",
+            "확인을 누른 뒤, 눌러야 하는 버튼(보라색 Allow)을 드래그로 감싸세요.\n"
+            "버튼 테두리에 최대한 딱 맞게 잡으면 정확도가 올라갑니다.\n"
+            "Esc 를 누르면 취소됩니다.",
+        )
+        monitor = self._selected_monitor()
+        bounds = None
+        if monitor is not None and self._monitor_index() > 0:
+            bounds = (
+                monitor["left"], monitor["top"], monitor["width"], monitor["height"],
+            )
+        self.root.withdraw()
+        self.root.update()
+        time.sleep(0.15)
+        try:
+            rect = select_region(self.root, self.adapter, bounds)
+        finally:
+            self.root.deiconify()
+            self.root.lift()
+        if rect is None:
+            self._log("버튼 영역 지정을 취소했습니다.")
+            return
+
+        try:
+            image, scale = self.capture.grab(rect)
+        except Exception as exc:
+            messagebox.showerror("버튼 영역 지정 실패", f"화면 캡처 실패: {exc}")
+            return
+
+        template = make_template(image)
+        if template is None:
+            messagebox.showerror("버튼 영역 지정 실패", "영역이 너무 작습니다.")
+            return
+
+        # 사용자가 경계를 직접 알려줬으므로 그 영역 자체를 측정한다.
+        result = calibrate_from_rect(image, self.cfg.detector)
+        self.cfg.button_rect = rect
+        self.cfg.template = template
+        if result is not None:
+            self.cfg.detector = result.config
+            self._log(f"버튼 영역 지정: {rect} / {result.describe()}")
+            for warning in result.warnings:
+                self._log(f"  주의: {warning}")
+        else:
+            self._log(
+                f"버튼 영역 지정: {rect} (색 측정은 실패했지만 견본 모양은 등록했습니다)"
+            )
+        self.cfg.click_policy = "match"
+        self.policy_var.set("match")
+        self._detector_to_ui()
+        self._update_template_label()
+
+        # 감시 영역이 없거나 버튼을 포함하지 않으면 버튼 주변으로 잡아준다.
+        needs_region = self.region is None or not self._region_contains(rect)
+        if needs_region or messagebox.askyesno(
+            "감시 영역",
+            "감시 영역도 이 버튼 주변으로 다시 잡을까요?\n"
+            "아니오를 누르면 현재 영역을 유지합니다.",
+        ):
+            margin_x = max(40, rect.width)
+            margin_y = max(30, rect.height * 2)
+            self.region = Region(
+                rect.x - margin_x,
+                rect.y - margin_y,
+                rect.width + margin_x * 2,
+                rect.height + margin_y * 2,
+            )
+            self.cfg.region = self.region
+            self._update_region_label()
+            self._log(f"감시 영역: {self.region}")
+
+        self._save(quiet=True)
+        self._test_once(quiet=True)
+
+    def _region_contains(self, rect: Region) -> bool:
+        if self.region is None:
+            return False
+        return (
+            rect.x >= self.region.x
+            and rect.y >= self.region.y
+            and rect.right <= self.region.right
+            and rect.bottom <= self.region.bottom
+        )
+
+    def _template_from_file(self) -> None:
+        """PNG/GIF 이미지 파일을 버튼 견본으로 등록한다 (스크린샷 잘라낸 것 등)."""
+        path = filedialog.askopenfilename(
+            title="버튼 견본 이미지 선택",
+            filetypes=[("PNG/GIF 이미지", "*.png *.gif"), ("모든 파일", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            photo = tk.PhotoImage(file=path)
+            image = photo_to_numpy(photo)
+        except Exception as exc:
+            messagebox.showerror(
+                "이미지 읽기 실패",
+                f"{exc}\n\nPNG 또는 GIF 만 지원합니다 (JPEG 는 지원하지 않습니다).",
+            )
+            return
+
+        template = make_template(image)
+        if template is None:
+            messagebox.showerror("견본 등록 실패", "이미지가 너무 작습니다.")
+            return
+        result = calibrate_from_rect(image, self.cfg.detector)
+        self.cfg.template = template
+        self.cfg.button_rect = None  # 파일로 등록한 견본은 위치 정보가 없다
+        if result is not None:
+            self.cfg.detector = result.config
+            self._log(f"이미지로 견본 등록: {Path(path).name} / {result.describe()}")
+        else:
+            self._log(f"이미지로 견본 등록: {Path(path).name} (모양만 등록)")
+        self.cfg.click_policy = "match"
+        self.policy_var.set("match")
+        self._detector_to_ui()
+        self._update_template_label()
+        self._save(quiet=True)
+        if self.region is not None:
+            self._test_once(quiet=True)
+
+    def _clear_template(self) -> None:
+        self.cfg.template = None
+        self.cfg.button_rect = None
+        self.cfg.click_policy = "leftmost"
+        self.policy_var.set("leftmost")
+        self._update_template_label()
+        self._log("버튼 견본을 지웠습니다. 색/모양 자동 판단으로 돌아갑니다.")
+        self._save(quiet=True)
 
     def _calibrate(self) -> None:
         """실제 버튼을 클릭해서 색/크기/채움율/글자비율을 직접 측정한다."""
@@ -582,6 +787,7 @@ class AllowClickerApp:
             self._update_region_label()
             self._log(f"감시 영역을 버튼 주변으로 설정: {suggested}")
 
+        self._save(quiet=True)
         self._test_once(quiet=True)
 
     def _reset_detector(self) -> None:
@@ -607,6 +813,7 @@ class AllowClickerApp:
         self.max_h_var.set(str(det.max_height))
         self.fill_var.set(f"{det.min_fill:g}")
         self.require_text_var.set(det.require_text)
+        self.match_var.set(f"{det.min_shape_match:g}")
         self._update_swatch()
 
     def _test_once(self, quiet: bool = False) -> None:
@@ -622,8 +829,10 @@ class AllowClickerApp:
             messagebox.showerror("캡처 실패", str(exc))
             return
         stats = DetectStats()
-        detections = detect(image, self.cfg.detector, stats)
-        target = pick_target(detections, self.cfg.click_policy)
+        template = self.cfg.template
+        detections = detect(image, self.cfg.detector, stats, template=template)
+        policy = "match" if template is not None else self.cfg.click_policy
+        target = pick_target(detections, policy)
         self._draw_preview(image, scale, target)
         if target is None:
             # 왜 못 찾았는지 근거를 남긴다. 추측하지 않게 하는 게 목적.
@@ -654,11 +863,15 @@ class AllowClickerApp:
                 self._draw_preview(image, scale, auto[0])
         else:
             cx, cy = target.center
+            match_note = (
+                f" 견본일치 {target.match:.2f}" if target.match > -2.0 else ""
+            )
             self._log(
                 f"한 번 검사: {target.width}x{target.height} "
-                f"채움 {target.fill:.2f} 글자 {target.text_ratio:.2f} -> "
+                f"채움 {target.fill:.2f} 글자 {target.text_ratio:.2f}{match_note} -> "
                 f"화면 좌표 ({int(self.region.x + cx / scale)}, "
                 f"{int(self.region.y + cy / scale)})"
+                + (f" / 후보 {len(detections)}개" if len(detections) > 1 else "")
             )
 
     def _start(self) -> None:
@@ -792,7 +1005,8 @@ class AllowClickerApp:
         if self.worker:
             self.worker.stop()
             self.worker.join(timeout=2.0)
-        self._collect()
+        # 마지막 상태를 저장한다 (입력값이 잘못돼 있어도 나머지는 남긴다)
+        self._collect(silent=True)
         try:
             save_config(self.config_dir, self.cfg)
         except OSError:
