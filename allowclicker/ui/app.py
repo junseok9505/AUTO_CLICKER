@@ -27,6 +27,7 @@ from ..detector import (
     detect_auto,
     make_template,
     pick_target,
+    trim_to_button,
 )
 from ..geometry import Region
 from ..platforms import get_adapter
@@ -614,13 +615,28 @@ class AllowClickerApp:
             messagebox.showerror("버튼 영역 지정 실패", f"화면 캡처 실패: {exc}")
             return
 
-        template = make_template(image)
+        # 드래그에 섞인 여백을 잘라내 버튼 경계에 맞춘다 (일치도가 크게 좌우된다).
+        button_image, (off_x, off_y) = trim_to_button(image)
+        if button_image.shape != image.shape:
+            self._log(
+                f"지정 영역에서 버튼만 잘라냈습니다: "
+                f"{image.shape[1]}x{image.shape[0]} -> "
+                f"{button_image.shape[1]}x{button_image.shape[0]}"
+            )
+            rect = Region(
+                rect.x + int(off_x / scale),
+                rect.y + int(off_y / scale),
+                int(button_image.shape[1] / scale),
+                int(button_image.shape[0] / scale),
+            )
+
+        template = make_template(button_image)
         if template is None:
             messagebox.showerror("버튼 영역 지정 실패", "영역이 너무 작습니다.")
             return
 
         # 사용자가 경계를 직접 알려줬으므로 그 영역 자체를 측정한다.
-        result = calibrate_from_rect(image, self.cfg.detector)
+        result = calibrate_from_rect(button_image, self.cfg.detector)
         self.cfg.button_rect = rect
         self.cfg.template = template
         if result is not None:
@@ -657,7 +673,36 @@ class AllowClickerApp:
             self._log(f"감시 영역: {self.region}")
 
         self._save(quiet=True)
-        self._test_once(quiet=True)
+        self._verify_template()
+
+    def _verify_template(self) -> None:
+        """등록한 견본으로 지금 화면에서 실제로 찾아지는지 바로 확인한다."""
+        if self.region is None or self.cfg.template is None:
+            return
+        try:
+            image, scale = self.capture.grab(self.region)
+        except Exception as exc:
+            self._log(f"견본 확인용 캡처 실패: {exc}")
+            return
+        stats = DetectStats()
+        found = detect(image, self.cfg.detector, stats, template=self.cfg.template)
+        if found:
+            target = pick_target(found, "match")
+            self._draw_preview(image, scale, target)
+            self._log(f"견본 확인: 일치도 {target.match:.2f} 로 찾았습니다.")
+            return
+
+        scores = [
+            info["match"] for _reason, info in stats.rejected if "match" in info
+        ]
+        if scores:
+            self._log(
+                f"주의: 견본 일치도가 최고 {max(scores):.2f} 로 기준 "
+                f"{self.cfg.detector.min_shape_match:.2f} 에 못 미쳐 걸러졌습니다. "
+                "버튼 테두리에 더 맞게 다시 지정하거나 '일치도 최소'를 낮추세요."
+            )
+        else:
+            self._log("주의: 지금 화면에서 버튼을 찾지 못했습니다. '한 번 검사'로 확인하세요.")
 
     def _region_contains(self, rect: Region) -> bool:
         if self.region is None:
@@ -687,11 +732,12 @@ class AllowClickerApp:
             )
             return
 
-        template = make_template(image)
+        button_image, _offset = trim_to_button(image)
+        template = make_template(button_image)
         if template is None:
             messagebox.showerror("견본 등록 실패", "이미지가 너무 작습니다.")
             return
-        result = calibrate_from_rect(image, self.cfg.detector)
+        result = calibrate_from_rect(button_image, self.cfg.detector)
         self.cfg.template = template
         self.cfg.button_rect = None  # 파일로 등록한 견본은 위치 정보가 없다
         if result is not None:

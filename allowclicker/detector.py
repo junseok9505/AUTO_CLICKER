@@ -274,6 +274,28 @@ def make_template(crop: np.ndarray) -> ButtonTemplate | None:
     )
 
 
+def trim_to_button(crop: np.ndarray) -> tuple[np.ndarray, tuple[int, int]]:
+    """지정한 영역에서 버튼 본체만 잘라낸다. (잘린 이미지, (x, y) 오프셋)
+
+    사람이 드래그하면 버튼 밖 여백이 몇 픽셀 섞인다. 여백이 있으면 견본 안에서
+    글자 위치가 밀려서, 탐지된 버튼(덩어리 경계 그대로)과 무늬가 어긋나
+    일치도가 크게 떨어진다. 그래서 등록 시점에 버튼 경계로 맞춰준다.
+    """
+    reference = dominant_color(crop)
+    if reference is None:
+        return crop, (0, 0)
+    hue, sat, val = rgb_to_hsv(crop)
+    mask = _similar_mask(hue, sat, val, reference)
+    blobs = connected_components(mask)
+    if not blobs:
+        return crop, (0, 0)
+    # 픽셀 수가 가장 많은 덩어리가 버튼 본체다 (얇은 테두리선은 면적이 작다).
+    x0, y0, x1, y1, _area = max(blobs, key=lambda blob: blob[4])
+    if (x1 - x0) < 6 or (y1 - y0) < 4:
+        return crop, (0, 0)
+    return crop[y0:y1, x0:x1], (int(x0), int(y0))
+
+
 def match_score(crop: np.ndarray, template: ButtonTemplate) -> float:
     """견본과의 일치도 (-1~1). 밝기/대비 변화에 둔감한 정규 상호상관."""
     if crop.size == 0:
