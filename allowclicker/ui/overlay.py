@@ -12,6 +12,15 @@ from ..geometry import Region
 from ..platforms.base import PlatformAdapter
 
 
+def _display_count(adapter: PlatformAdapter) -> int:
+    """활성 디스플레이 수. 알 수 없으면 1 로 본다."""
+    try:
+        signature = adapter.display_signature()
+    except Exception:
+        return 1
+    return len(signature) if signature else 1
+
+
 class _FullScreenOverlay:
     def __init__(
         self,
@@ -26,10 +35,16 @@ class _FullScreenOverlay:
         self.window = tk.Toplevel(root)
         self.window.withdraw()
 
+        x, y, width, height = bounds or adapter.virtual_screen_bounds(root)
+
         # 특정 모니터만 덮을 때는 -fullscreen 대신 geometry 로 정확히 맞춘다.
+        # macOS 의 -fullscreen 은 '창이 놓인 디스플레이 한 대'만 덮는다. 그래서
+        # 모니터가 여러 대일 때 전체(가상 데스크톱)를 덮어야 하면 쓸 수 없다.
+        # 그 경우 geometry 로 가상 데스크톱 전체를 직접 덮는다.
         fullscreen = (
             getattr(adapter, "overlay_mode", "override") == "fullscreen"
             and bounds is None
+            and _display_count(adapter) <= 1
         )
         if not fullscreen:
             self.window.overrideredirect(True)
@@ -39,7 +54,6 @@ class _FullScreenOverlay:
         except tk.TclError:  # 일부 환경에서 미지원
             pass
 
-        x, y, width, height = bounds or adapter.virtual_screen_bounds(root)
         if fullscreen:
             # macOS: -fullscreen 이 Dock/메뉴바까지 덮어준다. 대신 창이 놓인
             # 디스플레이 한 대만 덮으므로 원점은 창이 뜬 뒤에 다시 읽는다.
