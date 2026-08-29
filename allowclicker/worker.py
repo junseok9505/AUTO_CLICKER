@@ -21,6 +21,7 @@ import numpy as np
 from .capture import ScreenCapture
 from .config import AppConfig
 from .detector import (
+    AMBIGUOUS_SCORE_GAP,
     MIN_AUTO_SCORE,
     Detection,
     DetectorConfig,
@@ -70,6 +71,8 @@ class ScanWorker(threading.Thread):
         self.last_click: dict | None = None
         self.calibrated = False
         self._weak_candidate_logged = False
+        self._ambiguous_logged = False
+        self._empty_logged = False
         # 사용자가 지정한 버튼 견본이 있으면 그것이 최우선 기준이다.
         self.template = config.template
         self.policy = "match" if self.template is not None else config.click_policy
@@ -122,9 +125,10 @@ class ScanWorker(threading.Thread):
                 if self._auto_calibrate(image):
                     self.calibrated = True
                 else:
+                    # 구체적인 이유는 _auto_calibrate 가 이미 남겼다.
                     self._log(
-                        "자동 캘리브레이션: 지금 영역에 버튼처럼 보이는 것이 없습니다. "
-                        "자동 탐지 모드로 감시하다가 버튼이 나타나면 그때 학습합니다."
+                        "자동 캘리브레이션: 아직 학습하지 않았습니다. 감시하면서 "
+                        "확실한 버튼이 나타나면 그때 학습합니다."
                     )
             except Exception as exc:
                 self._emit("error", f"자동 캘리브레이션 실패: {exc}")
@@ -283,6 +287,12 @@ class ScanWorker(threading.Thread):
         """
         candidates = detect_auto(image, DetectorConfig())
         if not candidates:
+            if not self._empty_logged:
+                self._empty_logged = True
+                self._log(
+                    "자동 캘리브레이션: 지금 영역에 버튼처럼 보이는 것이 없습니다. "
+                    "버튼이 나타나면 그때 학습합니다."
+                )
             return False
         best = candidates[0]
         if best.score < MIN_AUTO_SCORE:  # noqa: SIM102 - 로그를 위해 분리
@@ -297,6 +307,27 @@ class ScanWorker(threading.Thread):
                     "정확해집니다."
                 )
             return False
+
+        # 비슷하게 생긴 것이 여러 개면 아무거나 고르지 않는다. 한 번 잘못 학습하면
+        # 기준 전체가 엉뚱한 UI 요소에 맞춰지고, 그 뒤로는 계속 그것을 클릭한다.
+        rivals = [
+            c
+            for c in candidates[1:]
+            if best.score - c.score <= AMBIGUOUS_SCORE_GAP
+            and not _close(c.center, best.center, 8.0)
+        ]
+        if rivals:
+            if not self._ambiguous_logged:
+                self._ambiguous_logged = True
+                self._log(
+                    f"자동 캘리브레이션: 영역 안에 똑같이 생긴 후보가 "
+                    f"{len(rivals) + 1}개 있어(1등 {best.score:.2f} / "
+                    f"2등 {rivals[0].score:.2f}) 어느 것이 눌러야 할 버튼인지 "
+                    "가릴 수 없습니다. '버튼 영역 지정'으로 버튼을 직접 알려주거나 "
+                    "감시 영역을 버튼 주변으로 좁혀 주세요."
+                )
+            return False
+
         cx, cy = best.center
         result = calibrate_at(image, (int(cx), int(cy)), self.config.detector)
         if result is None:

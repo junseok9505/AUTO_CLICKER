@@ -11,6 +11,12 @@ from .geometry import Region
 
 CONFIG_FILENAME = "config.json"
 
+# 예전 기본값들. 저장된 값이 예전 기본값과 정확히 같으면 사용자가 손댄 적이 없다고
+# 보고 새 기본값으로 올린다. 0.28/0.25 는 대화 본문의 인라인 코드 배경(#342F44,
+# 채도 0.31/명도 0.27) 같은 '옅게 깔린 같은 색'까지 버튼 후보로 통과시켜서,
+# 화면 곳곳의 어두운 보라 덩어리를 버튼으로 오인하게 만든다.
+_OUTDATED_DEFAULTS = {"sat_min": 0.28, "val_min": 0.25}
+
 
 @dataclass
 class AppConfig:
@@ -33,6 +39,7 @@ class AppConfig:
     auto_offset: bool = True  # 클릭 좌표 자동 보정
     click_offset_x: int = 0  # 학습된 보정값
     click_offset_y: int = 0
+    notes: list[str] = field(default_factory=list)  # 불러올 때 생긴 안내 (저장 안 함)
 
     def to_dict(self) -> dict:
         return {
@@ -66,6 +73,7 @@ class AppConfig:
         cfg.button_rect = Region.from_dict(data.get("button_rect"))
         cfg.template = ButtonTemplate.from_dict(data.get("template"))
         cfg.detector = DetectorConfig.from_dict(data.get("detector"))
+        cfg.notes = _upgrade_detector(cfg.detector, data.get("detector"))
         for key in (
             "interval",
             "cooldown",
@@ -90,6 +98,30 @@ class AppConfig:
                 except (TypeError, ValueError):
                     pass
         return cfg
+
+
+def _upgrade_detector(detector: DetectorConfig, stored: dict | None) -> list[str]:
+    """예전 기본값이 저장돼 있으면 새 기본값으로 올린다.
+
+    설정 파일에는 모든 항목이 그대로 저장되기 때문에, 기본값이 바뀌어도 예전에
+    저장한 파일을 쓰는 동안에는 옛 값이 계속 살아 있다. 사용자가 직접 고친 값은
+    건드리지 않고, '한 번도 손대지 않은 예전 기본값'만 올린다.
+    """
+    if not stored:
+        return []
+    fresh = DetectorConfig()
+    notes: list[str] = []
+    for key, old_default in _OUTDATED_DEFAULTS.items():
+        new_default = getattr(fresh, key)
+        if abs(float(stored.get(key, new_default)) - old_default) < 1e-9:
+            setattr(detector, key, new_default)
+            notes.append(f"{key} {old_default:g} -> {new_default:g}")
+    if notes:
+        return [
+            "인식 기준을 새 기본값으로 올렸습니다 (" + ", ".join(notes) + "). "
+            "예전 값은 대화 본문의 옅은 보라 배경까지 버튼으로 인식했습니다."
+        ]
+    return []
 
 
 def config_path(config_dir: Path) -> Path:

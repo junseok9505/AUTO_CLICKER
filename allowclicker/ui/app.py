@@ -19,6 +19,7 @@ from .. import __version__
 from ..capture import ScreenCapture
 from ..config import AppConfig, config_path, load_config, save_config
 from ..detector import (
+    AMBIGUOUS_SCORE_GAP,
     DetectorConfig,
     DetectStats,
     calibrate_at,
@@ -106,6 +107,8 @@ class AllowClickerApp:
             f"플랫폼: {self.adapter.name}  UI 배율: {self.ui_scale:.2f}  "
             f"설정파일: {config_path(self.config_dir)}"
         )
+        for note in self.cfg.notes:
+            self._log(f"안내: {note}")
         for note in self.adapter.permission_notes():
             self._log(f"안내: {note}")
         for problem in self.adapter.check_permissions():
@@ -153,6 +156,7 @@ class AllowClickerApp:
         self.min_h_var = tk.StringVar(value=str(det.min_height))
         self.max_h_var = tk.StringVar(value=str(det.max_height))
         self.fill_var = tk.StringVar(value=f"{det.min_fill:g}")
+        self.label_var = tk.StringVar(value=f"{det.max_label_offset:g}")
         self.require_text_var = tk.BooleanVar(value=det.require_text)
 
     def _entry(
@@ -306,6 +310,7 @@ class AllowClickerApp:
         self._entry(adv, "가로 최대", self.max_w_var, 1, 1)
         self._entry(adv, "세로 최소", self.min_h_var, 1, 2)
         self._entry(adv, "세로 최대", self.max_h_var, 2, 0)
+        self._entry(adv, "라벨 쏠림 최대", self.label_var, 2, 1)
         text_chk = ttk.Checkbutton(
             adv, text="버튼 안에 밝은 글자가 있어야 인식", variable=self.require_text_var
         )
@@ -439,6 +444,7 @@ class AllowClickerApp:
             det.sat_min = _clamp(float(self.sat_var.get()), 0.0, 1.0)
             det.val_min = _clamp(float(self.val_var.get()), 0.0, 1.0)
             det.min_fill = _clamp(float(self.fill_var.get()), 0.0, 1.0)
+            det.max_label_offset = _clamp(float(self.label_var.get()), 0.0, 0.5)
             det.min_width = int(self.min_w_var.get())
             det.max_width = int(self.max_w_var.get())
             det.min_height = int(self.min_h_var.get())
@@ -926,6 +932,7 @@ class AllowClickerApp:
         self.min_h_var.set(str(det.min_height))
         self.max_h_var.set(str(det.max_height))
         self.fill_var.set(f"{det.min_fill:g}")
+        self.label_var.set(f"{det.max_label_offset:g}")
         self.require_text_var.set(det.require_text)
         self.match_var.set(f"{det.min_shape_match:g}")
         self._update_swatch()
@@ -967,6 +974,16 @@ class AllowClickerApp:
                     f"  참고: 자동 탐지로는 후보 {len(auto)}개가 보입니다 "
                     "(시작하면 자동 캘리브레이션이 이 중에서 학습합니다)."
                 )
+                close_call = (
+                    len(auto) > 1
+                    and auto[0].score - auto[1].score <= AMBIGUOUS_SCORE_GAP
+                )
+                if close_call:
+                    self._log(
+                        "  주의: 후보들이 서로 비슷해서 자동 학습이 엉뚱한 것을 고를 수 "
+                        "있습니다. '버튼 영역 지정'으로 버튼을 직접 알려주거나 감시 "
+                        "영역을 버튼 주변으로 좁히세요."
+                    )
                 for candidate in auto[:3]:
                     self._log(
                         f"    후보 {candidate.width}x{candidate.height} "
@@ -987,6 +1004,13 @@ class AllowClickerApp:
                 f"{int(self.region.y + cy / scale)})"
                 + (f" / 후보 {len(detections)}개" if len(detections) > 1 else "")
             )
+            if template is None and len(detections) > 1:
+                # 후보가 여럿이면 '초록 사각형이 실제 버튼인지'를 꼭 봐야 한다.
+                self._log(
+                    f"  주의: 조건을 통과한 것이 {len(detections)}개입니다. 미리보기의 "
+                    "초록 사각형이 실제 버튼인지 확인하고, 아니면 '버튼 영역 지정'으로 "
+                    "버튼을 직접 알려주거나 영역을 좁히세요."
+                )
 
     def _start(self) -> None:
         if self.worker and self.worker.is_alive():

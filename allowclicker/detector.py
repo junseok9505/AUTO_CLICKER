@@ -30,8 +30,12 @@ class DetectorConfig:
 
     hue_center: float = 258.0  # 보라색 (#8B5CF6 계열)
     hue_tolerance: float = 30.0
-    sat_min: float = 0.28
-    val_min: float = 0.25
+    # 채도/명도 하한은 '색이 꽉 찬 강조색 버튼'과 '같은 색을 옅게 깐 배경'을
+    # 가르는 선이다. 실측: Kiro 강조색 버튼 #7454DE = 채도 0.62 / 명도 0.87,
+    # 대화 본문의 인라인 코드 배경 #342F44 = 채도 0.31 / 명도 0.27.
+    # 하한이 낮으면 코드 배경 같은 어두운 보라 덩어리가 전부 버튼 후보가 된다.
+    sat_min: float = 0.45
+    val_min: float = 0.55
     min_width: int = 30
     max_width: int = 600
     min_height: int = 14
@@ -44,6 +48,10 @@ class DetectorConfig:
     max_text_ratio: float = 0.50
     text_val_min: float = 0.70
     text_sat_max: float = 0.45
+    # 내부 밝은 픽셀의 가로 무게중심이 중앙에서 얼마나 벗어나도 되는지 (폭 대비 비율).
+    # 글자 라벨은 가운데 정렬이라 편차가 거의 0인데, 토글 스위치의 흰 손잡이는
+    # 한쪽으로 몰려 있다. 실측: 글자 버튼 0.02 이하, Autopilot 토글 0.21.
+    max_label_offset: float = 0.15
     # 버튼 견본(템플릿)이 있을 때 요구하는 모양 일치도 (-1~1). 밝기 변화에 강한 ZNCC.
     min_shape_match: float = 0.45
 
@@ -111,6 +119,21 @@ def rgb_to_hsv(rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
 def hue_distance(hue: np.ndarray, center: float) -> np.ndarray:
     """색상환에서의 최단 거리(0~180)."""
     return np.abs(((hue - center + 180.0) % 360.0) - 180.0)
+
+
+def label_offset(bright: np.ndarray) -> float:
+    """덩어리 안 밝은 픽셀의 가로 무게중심이 중앙에서 벗어난 정도 (폭 대비 0~0.5).
+
+    글자 라벨은 가운데 정렬이라 이 값이 0에 가깝다. 반면 토글 스위치의 흰 손잡이는
+    한쪽 끝에 몰려 있어 0.2 이상 나온다. 스위치와 버튼은 색·크기·채움율이 사실상
+    같아서 구분할 방법이 없는데, 이 값으로는 갈린다.
+    """
+    total = float(bright.sum())
+    width = bright.shape[1] if bright.ndim == 2 else 0
+    if total <= 0.0 or width < 2:
+        return 0.0
+    centroid = float(bright.sum(axis=0).astype(np.float64) @ np.arange(width)) / total
+    return abs(centroid - (width - 1) / 2.0) / float(width)
 
 
 class _UnionFind:
@@ -435,6 +458,14 @@ def detect(
                 f"{config.min_text_ratio}~{config.max_text_ratio}"
             )
             continue
+        offset = label_offset(bright[y0:y1, x0:x1]) if config.require_text else 0.0
+        if config.require_text and offset > config.max_label_offset:
+            # 글자 라벨이라면 가운데 정렬인데 한쪽으로 몰려 있다 -> 토글 스위치 등.
+            reject(
+                f"밝은 부분이 한쪽으로 쏠림 {offset:.2f} > "
+                f"{config.max_label_offset:.2f} (글자 라벨이 아니라 스위치 손잡이 모양)"
+            )
+            continue
 
         match = -2.0
         if template is not None:
@@ -471,16 +502,24 @@ PREFERRED_HUE = 265.0  # 보라색을 우선하되 다른 색도 후보로 본�
 MAX_BUCKETS_SCANNED = 6
 TYPICAL_TEXT_RATIO = 0.12  # 글자가 있는 버튼의 대표적인 밝은 픽셀 비율
 MIN_AUTO_SCORE = 0.55  # 자동 학습을 신뢰할 최소 점수
+# 1등과 2등 점수 차가 이보다 작으면 '어느 것이 그 버튼인지' 판단할 수 없다고 본다.
+AMBIGUOUS_SCORE_GAP = 0.06
 
 
 def button_likeness(
-    width: int, height: int, fill: float, text_ratio: float, hue: float
+    width: int,
+    height: int,
+    fill: float,
+    text_ratio: float,
+    hue: float,
+    offset: float = 0.0,
 ) -> float:
     """'버튼답기' 점수 (0~1).
 
     긴 막대(강조 표시줄), 큰 패널, 글자 없는 색 블록보다
-    '적당한 크기 + 적당한 비율 + 내부에 글자' 인 것을 높게 본다.
+    '적당한 크기 + 적당한 비율 + 내부에 가운데 정렬된 글자' 인 것을 높게 본다.
     보라색이면 가점을 주되, 다른 색 버튼도 후보로 남긴다.
+    offset 은 내부 밝은 픽셀의 가로 쏠림(label_offset)이다.
     """
     aspect = width / float(max(1, height))
     if 1.5 <= aspect <= 5.0:
@@ -496,10 +535,13 @@ def button_likeness(
     purple_score = 1.0 - min(
         1.0, float(hue_distance(np.array([float(hue)]), PREFERRED_HUE)[0]) / 90.0
     )
+    # 라벨이 가운데 있을수록 버튼답다 (한쪽으로 몰려 있으면 스위치 손잡이).
+    label_score = max(0.0, 1.0 - offset / 0.15)
     return round(
-        purple_score * 0.30
-        + text_score * 0.25
-        + aspect_score * 0.20
+        purple_score * 0.25
+        + text_score * 0.20
+        + label_score * 0.15
+        + aspect_score * 0.15
         + fill * 0.15
         + size_score * 0.10,
         3,
@@ -560,20 +602,27 @@ def detect_auto(
                 integral[y1, x1] - integral[y0, x1] - integral[y1, x0] + integral[y0, x0]
             )
             text_ratio = bright_count / float(width * height)
+            info = {
+                "x": int(x0),
+                "y": int(y0),
+                "w": int(width),
+                "h": int(height),
+                "fill": float(fill),
+                "text_ratio": float(text_ratio),
+            }
             if not (config.min_text_ratio <= text_ratio <= config.max_text_ratio):
                 if stats is not None:
                     stats.rejected.append(
-                        (
-                            f"글자비율 {text_ratio:.3f} (색상 {center:.0f}°)",
-                            {
-                                "x": int(x0),
-                                "y": int(y0),
-                                "w": int(width),
-                                "h": int(height),
-                                "fill": float(fill),
-                                "text_ratio": float(text_ratio),
-                            },
-                        )
+                        (f"글자비율 {text_ratio:.3f} (색상 {center:.0f}°)", info)
+                    )
+                continue
+            offset = label_offset(bright[y0:y1, x0:x1])
+            if offset > config.max_label_offset:
+                # 여기서 잘못 학습하면 설정 전체가 엉뚱한 UI 요소에 맞춰진다.
+                # 스위치 손잡이처럼 밝은 부분이 쏠린 것은 후보에서 뺀다.
+                if stats is not None:
+                    stats.rejected.append(
+                        (f"밝은 부분 쏠림 {offset:.2f} (스위치 모양)", info)
                     )
                 continue
 
@@ -593,6 +642,7 @@ def detect_auto(
                 fill=fill,
                 text_ratio=text_ratio,
                 hue=blob_hue,
+                offset=offset,
             )
             results.append(
                 Detection(
@@ -640,7 +690,8 @@ def pick_target(
     """클릭할 후보 하나를 고른다.
 
     match   : 견본과 가장 비슷한 것 (버튼 견본이 있을 때 기본)
-    leftmost: 같은 줄(row_tolerance 이내)에서 가장 왼쪽 -> Kiro 대화상자의 'Allow'
+    leftmost: 가장 버튼다운 후보와 같은 줄(row_tolerance 이내)에서 가장 왼쪽
+              -> Kiro 대화상자의 'Allow'
     score   : 점수가 가장 높은 것
     """
     if not detections:
@@ -652,8 +703,11 @@ def pick_target(
         return min(close, key=lambda d: (d.y // max(1, row_tolerance), d.x))
     if policy == "score":
         return detections[0]
-    top = min(d.y for d in detections)
-    same_row = [d for d in detections if d.y - top <= row_tolerance]
+    # 기준 줄은 '화면 맨 위'가 아니라 '가장 점수가 높은 후보가 있는 줄'이다.
+    # 감시 영역이 넓으면 버튼보다 위쪽에 상관없는 요소(토글, 아이콘, 강조 표시)가
+    # 들어오는데, 맨 위를 기준으로 잡으면 매번 그것을 클릭하게 된다.
+    anchor = max(detections, key=lambda d: d.score)
+    same_row = [d for d in detections if abs(d.y - anchor.y) <= row_tolerance]
     return min(same_row, key=lambda d: d.x)
 
 
@@ -798,6 +852,7 @@ def calibrate_at(
 
     bright = (val >= cfg.text_val_min) & (sat <= cfg.text_sat_max)
     text_ratio = float(bright[y0:y1, x0:x1].sum()) / float(bw * bh)
+    offset = label_offset(bright[y0:y1, x0:x1])
 
     cfg.min_width = max(6, int(bw * 0.6))
     cfg.max_width = int(bw * 2.0) + 8
@@ -811,6 +866,11 @@ def calibrate_at(
         cfg.require_text = True
         cfg.min_text_ratio = round(max(0.002, text_ratio * 0.4), 4)
         cfg.max_text_ratio = round(min(0.70, text_ratio * 2.5 + 0.05), 4)
+        # 이 버튼의 라벨이 실제로 치우쳐 있다면(아이콘+글자 등) 그만큼 넓혀준다.
+        # 그러지 않으면 방금 측정한 버튼이 '스위치 모양'으로 걸러진다.
+        cfg.max_label_offset = round(
+            max(DetectorConfig().max_label_offset, offset + 0.05), 3
+        )
     else:
         # 글자를 못 찾았으면(아이콘 버튼 등) 글자 조건을 끈다.
         cfg.require_text = False
@@ -875,6 +935,7 @@ def calibrate_from_rect(
 
     bright = (val >= cfg.text_val_min) & (sat <= cfg.text_sat_max)
     text_ratio = float(bright.mean())
+    offset = label_offset(bright)
 
     cfg.min_width = max(6, int(width * 0.6))
     cfg.max_width = int(width * 2.0) + 8
@@ -889,6 +950,9 @@ def calibrate_from_rect(
         cfg.require_text = True
         cfg.min_text_ratio = round(max(0.002, text_ratio * 0.4), 4)
         cfg.max_text_ratio = round(min(0.70, text_ratio * 2.5 + 0.05), 4)
+        cfg.max_label_offset = round(
+            max(DetectorConfig().max_label_offset, offset + 0.05), 3
+        )
     else:
         cfg.require_text = False
 
