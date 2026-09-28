@@ -20,11 +20,14 @@ from ..capture import ScreenCapture
 from ..config import AppConfig, config_path, load_config, save_config
 from ..detector import (
     AMBIGUOUS_SCORE_GAP,
+    AcceptStats,
+    Detection,
     DetectorConfig,
     DetectStats,
     calibrate_at,
     calibrate_from_rect,
     detect,
+    detect_accept,
     detect_auto,
     make_template,
     pick_target,
@@ -146,6 +149,10 @@ class AllowClickerApp:
         self.monitors: list[dict] = []  # mss 좌표계 기준 모니터 목록
         self.template_var = tk.StringVar()
         self.match_var = tk.StringVar(value=f"{det.min_shape_match:g}")
+        # Review changes 패널의 초록 Accept 버튼
+        self.accept_var = tk.BooleanVar(value=cfg.accept_enabled)
+        self.accept_pair_var = tk.BooleanVar(value=cfg.accept.require_partner)
+        self.accept_region_var = tk.StringVar()
 
         self.hue_var = tk.StringVar(value=f"{det.hue_center:g}")
         self.tol_var = tk.StringVar(value=f"{det.hue_tolerance:g}")
@@ -203,6 +210,31 @@ class AllowClickerApp:
         self.test_btn = ttk.Button(area, text="한 번 검사", command=self._test_once)
         self.test_btn.grid(row=0, column=2, padx=(4, 8))
         self._settings_widgets.append((self.select_btn, "normal"))
+
+        # Accept 버튼은 Allow 와 뜨는 자리가 달라 영역을 따로 지정할 수 있다.
+        ttk.Label(area, textvariable=self.accept_region_var, width=40).grid(
+            row=1, column=0, sticky="w", padx=8, pady=(0, 4)
+        )
+        accept_pick = ttk.Button(
+            area, text="Accept 영역 선택", command=self._select_accept_region
+        )
+        accept_pick.grid(row=1, column=1, padx=4, pady=(0, 4))
+        accept_clear = ttk.Button(
+            area, text="감시 영역과 같게", command=self._clear_accept_region
+        )
+        accept_clear.grid(row=1, column=2, padx=(4, 8), pady=(0, 4))
+        accept_chk = ttk.Checkbutton(
+            area,
+            text="Review changes 의 초록 Accept 버튼도 클릭",
+            variable=self.accept_var,
+            command=self._update_accept_region_label,
+        )
+        accept_chk.grid(row=2, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+        self._settings_widgets += [
+            (accept_pick, "normal"),
+            (accept_clear, "normal"),
+            (accept_chk, "normal"),
+        ]
 
         # --- 2. 색상/캘리브레이션
         color = ttk.LabelFrame(root, text="2. 버튼 인식 기준")
@@ -314,7 +346,14 @@ class AllowClickerApp:
         text_chk = ttk.Checkbutton(
             adv, text="버튼 안에 밝은 글자가 있어야 인식", variable=self.require_text_var
         )
-        text_chk.grid(row=3, column=0, columnspan=6, sticky="w", padx=8, pady=(2, 6))
+        text_chk.grid(row=3, column=0, columnspan=6, sticky="w", padx=8, pady=(2, 2))
+        pair_chk = ttk.Checkbutton(
+            adv,
+            text="Accept 는 오른쪽에 Reject 가 같이 있을 때만 클릭 (다른 초록 글자 오클릭 방지)",
+            variable=self.accept_pair_var,
+        )
+        pair_chk.grid(row=4, column=0, columnspan=6, sticky="w", padx=8, pady=(0, 6))
+        self._settings_widgets.append((pair_chk, "normal"))
         policy_label = ttk.Label(adv, text="여러 개 감지 시")
         policy_label.grid(row=2, column=2, sticky="e", padx=(8, 4))
         policy = ttk.Combobox(
@@ -373,6 +412,7 @@ class AllowClickerApp:
 
     def _apply_config_to_ui(self) -> None:
         self._update_region_label()
+        self._update_accept_region_label()
         self._update_swatch()
         self._update_offset_label()
         self._update_template_label()
@@ -393,6 +433,14 @@ class AllowClickerApp:
         self.region_var.set(
             f"선택됨: {self.region}" if self.region else "아직 선택되지 않았습니다"
         )
+
+    def _update_accept_region_label(self) -> None:
+        if not self.accept_var.get():
+            self.accept_region_var.set("Accept 영역: 사용 안 함")
+        elif self.cfg.accept_region is not None:
+            self.accept_region_var.set(f"Accept 영역: {self.cfg.accept_region}")
+        else:
+            self.accept_region_var.set("Accept 영역: 감시 영역과 같음")
 
     def _update_offset_label(self) -> None:
         if self.session_offset is not None:
@@ -438,6 +486,8 @@ class AllowClickerApp:
             cfg.click_policy = self.policy_var.get() or "leftmost"
             cfg.monitor_index = self._monitor_index()
             cfg.region = self.region
+            cfg.accept_enabled = bool(self.accept_var.get())
+            cfg.accept.require_partner = bool(self.accept_pair_var.get())
 
             det.hue_center = float(self.hue_var.get()) % 360.0
             det.hue_tolerance = _clamp(float(self.tol_var.get()), 1.0, 90.0)
@@ -563,7 +613,8 @@ class AllowClickerApp:
             self.region_var.set(f"범위 벗어남: {self.region} (재선택 필요)")
 
     # ------------------------------------------------------------ 동작 핸들러
-    def _select_region(self) -> None:
+    def _pick_region(self) -> Region | None:
+        """선택한 모니터 안에서 드래그로 영역을 받는다. 취소하면 None."""
         monitor = self._selected_monitor()
         bounds = None
         if monitor is not None and self._monitor_index() > 0:
@@ -577,10 +628,13 @@ class AllowClickerApp:
         self.root.update()
         time.sleep(0.15)  # 자기 창이 캡처/선택을 방해하지 않도록
         try:
-            region = select_region(self.root, self.adapter, bounds)
+            return select_region(self.root, self.adapter, bounds)
         finally:
             self.root.deiconify()
             self.root.lift()
+
+    def _select_region(self) -> None:
+        region = self._pick_region()
         if region is None:
             self._log("영역 선택을 취소했습니다.")
             return
@@ -590,6 +644,34 @@ class AllowClickerApp:
         self._log(f"영역 선택: {region}")
         self._save(quiet=True)  # 바로 저장해서 다음 실행에도 유지
         self._test_once(quiet=True)
+
+    def _select_accept_region(self) -> None:
+        """Accept 버튼이 뜨는 자리를 따로 감시 영역으로 잡는다."""
+        messagebox.showinfo(
+            "Accept 영역 선택",
+            "확인을 누른 뒤, Review changes 패널의 Accept / Reject 버튼이 뜨는 자리를\n"
+            "드래그로 감싸세요. 패널 높이가 바뀔 수 있으니 위아래로 조금 넉넉하게\n"
+            "잡는 편이 좋습니다. Accept 와 오른쪽 Reject 가 모두 들어가야 합니다.\n"
+            "Esc 를 누르면 취소됩니다.",
+        )
+        region = self._pick_region()
+        if region is None:
+            self._log("Accept 영역 선택을 취소했습니다.")
+            return
+        self.cfg.accept_region = region
+        self.accept_var.set(True)
+        self._update_accept_region_label()
+        self._log(f"Accept 영역 선택: {region}")
+        self._save(quiet=True)
+        if not self._collect(silent=True):
+            return
+        self._test_accept(None)
+
+    def _clear_accept_region(self) -> None:
+        self.cfg.accept_region = None
+        self._update_accept_region_label()
+        self._log("Accept 영역을 지웠습니다. 감시 영역 안에서 Accept 를 찾습니다.")
+        self._save(quiet=True)
 
     # ------------------------------------------------- 버튼 견본(클릭 대상) 지정
     def _update_template_label(self) -> None:
@@ -901,8 +983,11 @@ class AllowClickerApp:
         self.auto_calib_var.set(cfg.auto_calibrate)
         self.auto_offset_var.set(cfg.auto_offset)
         self.policy_var.set(cfg.click_policy)
+        self.accept_var.set(cfg.accept_enabled)
+        self.accept_pair_var.set(cfg.accept.require_partner)
         self._detector_to_ui()
         self._update_region_label()
+        self._update_accept_region_label()
         self._update_template_label()
         self._update_offset_label()
         if self.monitor_combo.cget("values"):
@@ -938,22 +1023,73 @@ class AllowClickerApp:
         self._update_swatch()
 
     def _test_once(self, quiet: bool = False) -> None:
-        if self.region is None:
+        accept_on = bool(self.accept_var.get())
+        if self.region is None and not (accept_on and self.cfg.accept_region):
             if not quiet:
                 messagebox.showwarning("영역 필요", "먼저 감시 영역을 선택하세요.")
             return
         if not self._collect():
             return
+        main = self._test_allow() if self.region is not None else None
+        if accept_on:
+            self._test_accept(main)
+
+    def _test_accept(
+        self, main: tuple[np.ndarray, float, Detection | None] | None
+    ) -> None:
+        """Accept 버튼을 한 번 찾아보고 결과를 로그와 미리보기에 남긴다.
+
+        main 은 방금 검사한 감시 영역의 (이미지, 배율, 표시 중인 대상)이다.
+        Accept 영역이 감시 영역과 같으면 그 이미지를 그대로 쓰고 두 대상을 함께 그린다.
+        """
+        region = self.cfg.accept_region or self.region
+        if region is None:
+            return
+        same_region = main is not None and region == self.region
+        if same_region:
+            image, scale, shown = main
+        else:
+            try:
+                image, scale = self.capture.grab(region)
+            except Exception as exc:
+                self._log(f"Accept 검사용 캡처 실패: {exc}")
+                return
+            shown = None
+
+        stats = AcceptStats()
+        found = detect_accept(image, self.cfg.accept, stats)
+        where = "감시 영역" if region == self.region else "Accept 영역"
+        if not found:
+            self._log(f"Accept 검사({where}): 못 찾음. {stats.summary()}")
+            for line in stats.rejected[:4]:
+                self._log(f"  제외: {line}")
+            if not same_region and main is None:
+                self._draw_preview(image, scale, None)
+            return
+
+        target = found[0]
+        cx, cy = target.center
+        self._log(
+            f"Accept 검사({where}): {target.width}x{target.height} 글자 -> 화면 좌표 "
+            f"({int(region.x + cx / scale)}, {int(region.y + cy / scale)})"
+            + (" / Reject 확인" if target.score >= 1.0 else " / Reject 없음")
+            + (f" / 후보 {len(found)}개" if len(found) > 1 else "")
+        )
+        self._draw_preview(image, scale, [t for t in (shown, target) if t is not None])
+
+    def _test_allow(self) -> tuple[np.ndarray, float, Detection | None] | None:
+        """보라색 Allow 버튼 검사. (이미지, 배율, 미리보기에 그린 대상) 반환."""
         try:
             image, scale = self.capture.grab(self.region)
         except Exception as exc:
             messagebox.showerror("캡처 실패", str(exc))
-            return
+            return None
         stats = DetectStats()
         template = self.cfg.template
         detections = detect(image, self.cfg.detector, stats, template=template)
         policy = "match" if template is not None else self.cfg.click_policy
         target = pick_target(detections, policy)
+        shown = target
         self._draw_preview(image, scale, target)
         if target is None:
             # 왜 못 찾았는지 근거를 남긴다. 추측하지 않게 하는 게 목적.
@@ -991,7 +1127,8 @@ class AllowClickerApp:
                         f"글자 {candidate.text_ratio:.2f} 위치 "
                         f"({candidate.x}, {candidate.y})"
                     )
-                self._draw_preview(image, scale, auto[0])
+                shown = auto[0]
+                self._draw_preview(image, scale, shown)
         else:
             cx, cy = target.center
             match_note = (
@@ -1011,6 +1148,7 @@ class AllowClickerApp:
                     "초록 사각형이 실제 버튼인지 확인하고, 아니면 '버튼 영역 지정'으로 "
                     "버튼을 직접 알려주거나 영역을 좁히세요."
                 )
+        return image, scale, shown
 
     def _start(self) -> None:
         if self.worker and self.worker.is_alive():
@@ -1027,6 +1165,12 @@ class AllowClickerApp:
             return
         if self._window_overlaps_region():
             self._log("경고: 이 창이 감시 영역과 겹칩니다. 창을 옆으로 옮기세요.")
+        if (
+            self.cfg.accept_enabled
+            and self.cfg.accept_region is not None
+            and self._window_overlaps_region(self.cfg.accept_region)
+        ):
+            self._log("경고: 이 창이 Accept 영역과 겹칩니다. 창을 옆으로 옮기세요.")
 
         problems = self.adapter.check_permissions()
         if problems:
@@ -1063,17 +1207,18 @@ class AllowClickerApp:
         self.status_var.set("정지")
         self._log(f"감시를 멈췄습니다 ({reason}).")
 
-    def _window_overlaps_region(self) -> bool:
-        if self.region is None:
+    def _window_overlaps_region(self, region: Region | None = None) -> bool:
+        region = region or self.region
+        if region is None:
             return False
         self.root.update_idletasks()
         wx, wy = self.root.winfo_rootx(), self.root.winfo_rooty()
         ww, wh = self.root.winfo_width(), self.root.winfo_height()
         return not (
-            wx > self.region.right
-            or wx + ww < self.region.x
-            or wy > self.region.bottom
-            or wy + wh < self.region.y
+            wx > region.right
+            or wx + ww < region.x
+            or wy > region.bottom
+            or wy + wh < region.y
         )
 
     # ------------------------------------------------------------ 미리보기/큐
@@ -1089,17 +1234,33 @@ class AllowClickerApp:
         off_x = max(0, (self.preview_w - small.shape[1]) // 2)
         off_y = max(0, (self.preview_h - small.shape[0]) // 2)
         canvas.create_image(off_x, off_y, image=photo, anchor="nw")
-        if target is not None:
-            x0 = off_x + target.x / step
-            y0 = off_y + target.y / step
+        # target 은 Detection 하나, 여러 개(list), 또는 None 이다.
+        if target is None:
+            targets = []
+        elif isinstance(target, (list, tuple)):
+            targets = [t for t in target if t is not None]
+        else:
+            targets = [target]
+        for item in targets:
+            x0 = off_x + item.x / step
+            y0 = off_y + item.y / step
             canvas.create_rectangle(
                 x0,
                 y0,
-                x0 + target.width / step,
-                y0 + target.height / step,
+                x0 + item.width / step,
+                y0 + item.height / step,
                 outline="#00e676",
                 width=2,
             )
+            if len(targets) > 1 or item.kind == "accept":
+                # 어느 버튼인지 구분할 수 있게 이름을 붙인다.
+                canvas.create_text(
+                    x0,
+                    max(0, y0 - 2),
+                    text=item.kind.capitalize(),
+                    anchor="sw",
+                    fill="#00e676",
+                )
 
     def _pump(self) -> None:
         latest_preview = None

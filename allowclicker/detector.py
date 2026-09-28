@@ -86,6 +86,7 @@ class Detection:
     score: float
     hue: float = -1.0  # 자동 탐지에서 추정한 색상(°). -1 = 미측정
     match: float = -2.0  # 견본과의 모양 일치도. -2 = 견본 없음
+    kind: str = "allow"  # allow = 보라색 Allow 버튼, accept = 초록 Accept 버튼
 
     @property
     def center(self) -> tuple[float, float]:
@@ -173,7 +174,12 @@ def connected_components(mask: np.ndarray) -> list[tuple[int, int, int, int, int
     runs: list[tuple[int, int, int]] = []  # (y, x0, x1)
     prev: list[tuple[int, int, int]] = []  # (index, x0, x1)
 
+    # 빈 줄은 run 이 없으니 건너뛴다 (결과는 같고, 드문드문한 마스크에서 훨씬 빠르다).
+    row_any = mask.any(axis=1)
     for y in range(height):
+        if not row_any[y]:
+            prev = []
+            continue
         current: list[tuple[int, int, int]] = []
         for x0, x1 in _row_runs(mask[y]):
             idx = uf.add()
@@ -978,3 +984,325 @@ def calibrate_from_rect(
         val=round(float(np.median(vals)), 3),
         warnings=warnings,
     )
+
+
+# ---------------------------------------------------------------------------
+# Accept 버튼 (Review changes 패널)
+#
+# 보라색 Allow 와 생김새가 정반대다. Allow 는 '색이 꽉 찬 버튼 + 흰 글자'인데,
+# Accept 는 '어두운 버튼 + 초록 글자'다. 그래서 버튼 면이 아니라 글자를 찾는다.
+# 실측 (Kiro 다크 테마, 100% 배율 스크린샷):
+#   Accept 글자 #56B784 부근 (색상 150°, 채도 0.55, 명도 0.72), 글자 50x16
+#   Accept 버튼 면 #2A3233 (채도 0.18, 명도 0.20)
+#   Reject 글자 #B0524E 부근 (색상 2°, 채도 0.56, 명도 0.69), Accept 오른쪽 24px
+#   패널 배경 #211D25
+# 같은 줄 위에 있는 초록 체크 아이콘(14x10)은 글자가 아니라 한 덩어리라 걸러진다.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class AcceptConfig:
+    """Accept 버튼(초록 글자) 탐지 파라미터."""
+
+    text_hue: float = 145.0  # 초록
+    text_hue_tolerance: float = 35.0
+    # 짝 버튼(Reject) 글자색. Accept 바로 오른쪽 같은 줄에 있어야 한다.
+    partner_hue: float = 0.0  # 빨강
+    partner_hue_tolerance: float = 25.0
+    text_sat_min: float = 0.35
+    text_val_min: float = 0.45
+    min_text_height: int = 7
+    max_text_height: int = 60
+    min_width: int = 20
+    max_width: int = 360
+    min_aspect: float = 1.8
+    max_aspect: float = 9.0
+    # 글자 획이 몇 조각인지. 체크 아이콘 같은 기호는 1~2 조각이다.
+    min_glyphs: int = 3
+    # 글자 bbox 안에서 글자색 픽셀 비율 (실측 Accept 0.24, Reject 0.30)
+    min_ink: float = 0.10
+    max_ink: float = 0.65
+    # 흰 글자의 ClearType 색 번짐은 흰 픽셀 옆에 붙어 있다. 진짜 색 글자에는
+    # 흰 픽셀이 거의 없으므로, 흰 픽셀이 많으면 번짐으로 본다.
+    max_white_ratio: float = 0.35
+    # 글자와 배경의 명도 차 (실측 0.52). 배경이 글자와 비슷하면 버튼이 아니다.
+    min_contrast: float = 0.25
+    # 배경이 채도 높은 색이면(초록 면 버튼 등) 이 패널의 버튼이 아니다.
+    max_bg_sat: float = 0.40
+    # Reject 가 옆에 있어야만 누른다. 대화 본문이나 탐색기의 초록 글자
+    # (새 파일 이름, 테스트 통과 로그 등)를 Accept 로 오인하지 않게 하는 핵심 조건.
+    require_partner: bool = True
+    # Accept 오른쪽 끝과 Reject 왼쪽 끝 사이 최대 거리 (글자 높이의 배수, 실측 1.5)
+    max_partner_gap: float = 5.0
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> "AcceptConfig":
+        cfg = cls()
+        if not data:
+            return cfg
+        for key, value in data.items():
+            if hasattr(cfg, key) and value is not None:
+                current = getattr(cfg, key)
+                try:
+                    setattr(cfg, key, type(current)(value))
+                except (TypeError, ValueError):
+                    pass
+        return cfg
+
+
+@dataclass
+class AcceptStats:
+    """Accept 를 왜 못 찾았는지 설명하기 위한 진단 정보."""
+
+    total_pixels: int = 0
+    text_pixels: int = 0  # 초록 글자색 픽셀 수
+    words: int = 0  # 초록 글자 덩어리(단어) 수
+    partners: int = 0  # 조건을 통과한 빨간 단어(Reject 후보) 수
+    rejected: list[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        return (
+            f"픽셀 {self.total_pixels}개 중 초록 글자색 {self.text_pixels}개, "
+            f"초록 단어 {self.words}개, Reject 후보 {self.partners}개"
+        )
+
+
+@dataclass(frozen=True)
+class _Word:
+    x: int
+    y: int
+    width: int
+    height: int
+    ink: float
+    hue: float
+
+    @property
+    def right(self) -> int:
+        return self.x + self.width
+
+    @property
+    def center_y(self) -> float:
+        return self.y + self.height / 2.0
+
+
+# 글자 사이 간격을 메워 한 단어로 묶을 때 쓰는 팽창 반경 (px)
+_WORD_JOIN_X = 2
+_WORD_JOIN_Y = 1
+
+
+def _dilate(mask: np.ndarray, rx: int, ry: int) -> np.ndarray:
+    """가로 rx, 세로 ry 만큼 팽창 (글자들을 단어 하나로 붙인다)."""
+    out = mask.copy()
+    for d in range(1, rx + 1):
+        out[:, d:] |= mask[:, :-d]
+        out[:, :-d] |= mask[:, d:]
+    wide = out.copy()
+    for d in range(1, ry + 1):
+        out[d:, :] |= wide[:-d, :]
+        out[:-d, :] |= wide[d:, :]
+    return out
+
+
+def _text_color_masks(
+    rgb: np.ndarray, config: AcceptConfig
+) -> tuple[np.ndarray, np.ndarray]:
+    """(Accept 글자색 마스크, Reject 글자색 마스크).
+
+    어두운 IDE 화면에서 색 글자 픽셀은 몇 퍼센트뿐이다. 전체 화면을 HSV 로 바꾸면
+    큰 영역에서 한 프레임이 수백 ms 걸리므로, 정수 연산으로 '채도·명도가 충분한'
+    픽셀만 먼저 골라 그 픽셀들만 HSV 로 계산한다. 결과는 전체 변환과 같다.
+    """
+    height, width = rgb.shape[:2]
+    green = np.zeros((height, width), dtype=bool)
+    red = np.zeros((height, width), dtype=bool)
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    # 채널 축 reduce(max(axis=2))보다 채널끼리 비교하는 편이 몇 배 빠르다.
+    # 255 * 100 이 int16 범위 안이라 int16 으로 충분하다.
+    mx = np.maximum(np.maximum(r, g), b).astype(np.int16)
+    mn = np.minimum(np.minimum(r, g), b).astype(np.int16)
+    # 내림한 정수 기준이라 정확한 실수 조건보다 넓다(누락 없음). 아래에서 다시 거른다.
+    candidate = (mx >= int(config.text_val_min * 255)) & (
+        (mx - mn) * 100 >= mx * int(config.text_sat_min * 100)
+    )
+    ys, xs = np.nonzero(candidate)
+    if ys.size == 0:
+        return green, red
+    hue, sat, val = rgb_to_hsv(rgb[ys, xs][np.newaxis, :, :])
+    hue, sat, val = hue[0], sat[0], val[0]
+    vivid = (sat >= config.text_sat_min) & (val >= config.text_val_min)
+    is_green = vivid & (hue_distance(hue, config.text_hue) <= config.text_hue_tolerance)
+    is_red = vivid & (
+        hue_distance(hue, config.partner_hue) <= config.partner_hue_tolerance
+    )
+    green[ys[is_green], xs[is_green]] = True
+    red[ys[is_red], xs[is_red]] = True
+    return green, red
+
+
+def _find_words(
+    mask: np.ndarray,
+    rgb: np.ndarray,
+    config: AcceptConfig,
+    stats: AcceptStats | None = None,
+    label: str = "",
+) -> list[_Word]:
+    """글자색 마스크에서 '단어 모양'인 글자 덩어리를 찾는다."""
+    words: list[_Word] = []
+    if not mask.any():
+        return words
+
+    joined = _dilate(mask, _WORD_JOIN_X, _WORD_JOIN_Y)
+    img_h, img_w = mask.shape
+
+    def reject(reason: str, x: int, y: int, w: int, h: int) -> None:
+        # 1~2픽셀 잡티는 진단에 도움이 안 된다.
+        if stats is not None and (w >= 8 or h >= 8):
+            stats.rejected.append(f"{label}{w}x{h} 위치 ({x}, {y}): {reason}")
+
+    for jx0, jy0, jx1, jy1, _area in connected_components(joined):
+        sub = mask[jy0:jy1, jx0:jx1]
+        rows = np.flatnonzero(sub.any(axis=1))
+        cols = np.flatnonzero(sub.any(axis=0))
+        if rows.size == 0 or cols.size == 0:
+            continue
+        x0, x1 = jx0 + int(cols[0]), jx0 + int(cols[-1]) + 1
+        y0, y1 = jy0 + int(rows[0]), jy0 + int(rows[-1]) + 1
+        w, h = x1 - x0, y1 - y0
+
+        if not (config.min_text_height <= h <= config.max_text_height):
+            reject(f"글자 높이 {h} 허용 {config.min_text_height}~{config.max_text_height}",
+                   x0, y0, w, h)
+            continue
+        if not (config.min_width <= w <= config.max_width):
+            reject(f"단어 폭 {w} 허용 {config.min_width}~{config.max_width}", x0, y0, w, h)
+            continue
+        aspect = w / float(h)
+        if not (config.min_aspect <= aspect <= config.max_aspect):
+            reject(f"비율 {aspect:.2f} 허용 {config.min_aspect}~{config.max_aspect}",
+                   x0, y0, w, h)
+            continue
+
+        box = mask[y0:y1, x0:x1]
+        ink_count = int(box.sum())
+        ink = ink_count / float(w * h)
+        if not (config.min_ink <= ink <= config.max_ink):
+            reject(f"글자 밀도 {ink:.2f} 허용 {config.min_ink}~{config.max_ink}",
+                   x0, y0, w, h)
+            continue
+        glyphs = sum(1 for blob in connected_components(box) if blob[4] >= 3)
+        if glyphs < config.min_glyphs:
+            reject(f"글자 조각 {glyphs}개 < {config.min_glyphs} (글자가 아니라 아이콘 모양)",
+                   x0, y0, w, h)
+            continue
+
+        # 여기부터는 단어 주변만 HSV 로 바꿔서 본다 (전체 변환은 비싸다).
+        pad_x, pad_y = max(3, h // 2), max(2, h // 3)
+        bx0, bx1 = max(0, x0 - pad_x), min(img_w, x1 + pad_x)
+        by0, by1 = max(0, y0 - pad_y), min(img_h, y1 + pad_y)
+        local_hue, local_sat, local_val = rgb_to_hsv(rgb[by0:by1, bx0:bx1])
+        inner = (slice(y0 - by0, y1 - by0), slice(x0 - bx0, x1 - bx0))
+
+        white = (local_val[inner] >= 0.70) & (local_sat[inner] <= 0.25)
+        white_ratio = int(white.sum()) / float(max(1, ink_count))
+        if white_ratio > config.max_white_ratio:
+            reject(f"흰 픽셀 비율 {white_ratio:.2f} > {config.max_white_ratio} "
+                   "(흰 글자의 색 번짐)", x0, y0, w, h)
+            continue
+
+        # 글자를 둘러싼 배경: 글자와 확실히 대비되고, 채도가 낮은 어두운 면이어야 한다.
+        around = ~joined[by0:by1, bx0:bx1]
+        if int(around.sum()) < 8:
+            reject("주변 배경을 잴 수 없음", x0, y0, w, h)
+            continue
+        bg_val = float(np.median(local_val[around]))
+        bg_sat = float(np.median(local_sat[around]))
+        text_val = float(np.median(local_val[inner][box]))
+        contrast = abs(text_val - bg_val)
+        if contrast < config.min_contrast:
+            reject(f"배경과 명도 차 {contrast:.2f} < {config.min_contrast}", x0, y0, w, h)
+            continue
+        if bg_sat > config.max_bg_sat:
+            reject(f"배경 채도 {bg_sat:.2f} > {config.max_bg_sat} (색 면 위의 글자)",
+                   x0, y0, w, h)
+            continue
+
+        radians = np.deg2rad(local_hue[inner][box])
+        word_hue = float(
+            np.rad2deg(np.arctan2(np.sin(radians).mean(), np.cos(radians).mean())) % 360.0
+        )
+        words.append(_Word(int(x0), int(y0), int(w), int(h), round(ink, 3),
+                           round(word_hue, 1)))
+    return words
+
+
+def _partner_of(word: _Word, partners: list[_Word], config: AcceptConfig) -> _Word | None:
+    """word 오른쪽 같은 줄에 있는 짝 버튼(Reject) 글자."""
+    best: _Word | None = None
+    best_gap = float("inf")
+    for other in partners:
+        gap = other.x - word.right
+        if gap < 0 or gap > config.max_partner_gap * word.height:
+            continue
+        if abs(other.center_y - word.center_y) > word.height * 0.4:
+            continue
+        if not (0.6 <= other.height / float(word.height) <= 1.6):
+            continue
+        if gap < best_gap:
+            best, best_gap = other, gap
+    return best
+
+
+def detect_accept(
+    rgb: np.ndarray,
+    config: AcceptConfig | None = None,
+    stats: AcceptStats | None = None,
+) -> list[Detection]:
+    """Review changes 패널의 초록 Accept 버튼을 찾는다.
+
+    결과 bbox 는 글자 영역이다. 글자 중앙은 항상 버튼 안이므로 그대로 클릭하면 된다.
+    Reject 가 옆에 있는 것을 앞에, 그다음은 위->아래, 왼쪽->오른쪽 순으로 돌려준다.
+    """
+    config = config or AcceptConfig()
+    if rgb.size == 0:
+        return []
+    green, red = _text_color_masks(rgb, config)
+    words = _find_words(green, rgb, config, stats, "초록 ")
+    if stats is not None:
+        stats.total_pixels = int(green.size)
+        stats.text_pixels = int(green.sum())
+        stats.words = len(words)
+    if not words:
+        return []
+
+    partners = _find_words(red, rgb, config)
+    if stats is not None:
+        stats.partners = len(partners)
+
+    results: list[Detection] = []
+    for word in words:
+        partner = _partner_of(word, partners, config)
+        if partner is None and config.require_partner:
+            if stats is not None:
+                stats.rejected.append(
+                    f"초록 {word.width}x{word.height} 위치 ({word.x}, {word.y}): "
+                    "오른쪽 같은 줄에 Reject(빨간 글자)가 없음"
+                )
+            continue
+        results.append(
+            Detection(
+                x=word.x,
+                y=word.y,
+                width=word.width,
+                height=word.height,
+                fill=word.ink,
+                text_ratio=0.0,
+                score=1.0 if partner is not None else 0.6,
+                hue=word.hue,
+                kind="accept",
+            )
+        )
+    results.sort(key=lambda d: (-d.score, d.y, d.x))
+    return results

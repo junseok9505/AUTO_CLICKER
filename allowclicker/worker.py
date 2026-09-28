@@ -1,6 +1,12 @@
 """감시 스레드: 캡처 -> 탐지 -> 클릭.
 
-안전 장치
+감시하는 버튼은 두 종류다.
+- Allow : 보라색 승인 버튼 (기본 감시 영역)
+- Accept: Review changes 패널의 초록 Accept 버튼 (따로 지정한 Accept 영역,
+          없으면 기본 감시 영역)
+둘은 뜨는 자리가 달라서 버튼마다 감시 상태(_Track)를 따로 둔다.
+
+안전 장치 (버튼마다 따로 적용)
 - confirm_frames: 같은 위치에서 연속으로 감지되어야 클릭 (렌더링 중간 오클릭 방지)
 - cooldown: 클릭 후 일정 시간 재클릭 금지
 - armed: 한 번 클릭하면 버튼이 화면에서 사라진 뒤에만 다시 클릭 (연타 방지)
@@ -27,6 +33,7 @@ from .detector import (
     DetectorConfig,
     calibrate_at,
     detect,
+    detect_accept,
     detect_auto,
     pick_target,
 )
@@ -37,6 +44,7 @@ PREVIEW_MIN_INTERVAL = 0.25  # 미리보기 전송 최소 간격(초)
 DISPLAY_CHECK_INTERVAL = 3.0  # 디스플레이 배치 변경 확인 간격(초)
 MAX_OFFSET = 200  # 누적 보정 한계(px)
 MAX_LEARN_STEP = 60  # 한 번에 학습할 수 있는 최대 차이(px). 큰 점프는 오학습이다.
+IDLE_STATUS = "대기 중"
 
 # 커서 이동 -> 클릭 사이의 지연. 짧을수록 반응이 빠르다.
 HOVER_SETTLE_SECONDS = 0.008  # 대상 앱이 마우스 이동을 처리할 최소 시간
@@ -48,6 +56,40 @@ CURSOR_RESTORE_DELAY = 0.02  # 클릭 후 커서를 되돌리기 전 여유
 class WorkerEvent:
     kind: str  # log | status | preview | click | error | stopped
     payload: Any = None
+
+
+@dataclass
+class _Track:
+    """버튼 한 종류(Allow 또는 Accept)의 감시 상태."""
+
+    kind: str  # allow | accept
+    label: str  # 로그 표시용
+    region: Region
+    streak: int = 0
+    last_center: tuple[float, float] | None = None
+    clicked_center: tuple[float, float] | None = None  # 이번 버튼을 이미 눌렀는지
+    retries_used: int = 0
+    first_attempt_at: float = 0.0
+    abandoned: bool = False
+    warned_stuck: bool = False
+    next_click_at: float = 0.0
+
+    def forget_button(self) -> None:
+        """버튼이 사라졌다. 다음 버튼을 위해 시도 이력을 비운다 (쿨다운은 유지)."""
+        self.streak = 0
+        self.last_center = None
+        self.clicked_center = None
+        self.retries_used = 0
+        self.first_attempt_at = 0.0
+        self.abandoned = False
+        self.warned_stuck = False
+
+    def forget_attempts(self) -> None:
+        """다른 버튼(또는 위치 이동) -> 시도 이력만 초기화."""
+        self.retries_used = 0
+        self.first_attempt_at = 0.0
+        self.abandoned = False
+        self.warned_stuck = False
 
 
 class ScanWorker(threading.Thread):
@@ -76,6 +118,14 @@ class ScanWorker(threading.Thread):
         # 사용자가 지정한 버튼 견본이 있으면 그것이 최우선 기준이다.
         self.template = config.template
         self.policy = "match" if self.template is not None else config.click_policy
+        # 버튼 종류별 감시 상태. Accept 는 뜨는 자리가 달라 영역을 따로 쓸 수 있다.
+        self.allow = _Track("allow", "Allow", region)
+        self.accept: _Track | None = (
+            _Track("accept", "Accept", config.accept_region or region)
+            if config.accept_enabled
+            else None
+        )
+        self.tracks = [self.allow] + ([self.accept] if self.accept else [])
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -90,15 +140,7 @@ class ScanWorker(threading.Thread):
     def run(self) -> None:  # noqa: C901 - 루프 상태 관리라 한 곳에 두는 편이 읽기 쉽다
         cfg = self.config
         interval = max(0.05, float(cfg.interval))
-        streak = 0
-        last_center: tuple[float, float] | None = None
-        clicked_center: tuple[float, float] | None = None  # 이번 버튼을 이미 눌렀는지
-        retries_used = 0
-        first_attempt_at = 0.0
-        abandoned = False
-        next_click_at = 0.0
         last_preview = 0.0
-        warned_stuck = False
         reason = "사용자 중지"
         display_sig = self.adapter.display_signature()
         next_display_check = time.monotonic() + DISPLAY_CHECK_INTERVAL
@@ -107,6 +149,14 @@ class ScanWorker(threading.Thread):
             f"감시 시작: {self.region} / 간격 {interval:.2f}s"
             + ("  [테스트 모드: 클릭 안 함]" if cfg.dry_run else "")
         )
+        if self.accept is not None:
+            if cfg.accept_region is not None:
+                self._log(f"Accept 버튼도 감시: Accept 영역 {self.accept.region}")
+            else:
+                self._log(
+                    "Accept 버튼도 감시: Accept 영역을 따로 지정하지 않아 감시 영역에서 "
+                    "찾습니다. Accept 가 다른 자리에 뜨면 'Accept 영역 선택'으로 지정하세요."
+                )
         if self.offset != [0, 0]:
             self._log(f"이전에 학습한 클릭 보정 적용: {tuple(self.offset)}")
 
@@ -151,7 +201,14 @@ class ScanWorker(threading.Thread):
                         reason = "디스플레이 구성 변경 감지 (영역 재설정 필요)"
                         break
 
-                image, scale = self.capture.grab(self.region)
+                # 영역이 같으면 한 번만 캡처해서 같이 쓴다.
+                frames: dict[Region, tuple[np.ndarray, float]] = {}
+                for track in self.tracks:
+                    if track.region not in frames:
+                        frames[track.region] = self.capture.grab(track.region)
+
+                # --- Allow (보라색)
+                image, _scale = frames[self.allow.region]
                 if not self.calibrated:
                     # 아직 학습 못 했으면 색 무관 자동 탐지로 버튼을 기다린다.
                     if self._auto_calibrate(image):
@@ -163,104 +220,48 @@ class ScanWorker(threading.Thread):
                     if self.calibrated
                     else []
                 )
-                target = pick_target(detections, self.policy)
+                targets: dict[str, Detection | None] = {
+                    "allow": pick_target(detections, self.policy)
+                }
 
-                if target is None:
-                    if streak:
-                        self._emit("status", "대기 중")
-                    streak = 0
-                    last_center = None
-                    clicked_center = None  # 버튼이 사라졌으니 다음 버튼을 위해 초기화
-                    retries_used = 0
-                    first_attempt_at = 0.0
-                    abandoned = False
-                    warned_stuck = False
-                else:
-                    center = target.center
-                    if last_center and _close(center, last_center, 6.0):
-                        streak += 1
-                    else:
-                        streak = 1
-                        warned_stuck = False
-                    last_center = center
+                # --- Accept (초록 글자). 보라색 학습 상태와 무관하게 늘 찾는다.
+                if self.accept is not None:
+                    accept_image, _scale = frames[self.accept.region]
+                    found = detect_accept(accept_image, cfg.accept)
+                    targets["accept"] = found[0] if found else None
 
                 now = time.monotonic()
-                if self._should_preview(now, last_preview, target):
-                    self._emit("preview", (image, scale, target))
+                has_target = any(t is not None for t in targets.values())
+                if self._should_preview(now, last_preview, has_target):
+                    self._emit("preview", self._preview_payload(frames, targets))
                     last_preview = now
 
-                if target is not None:
-                    self._emit(
-                        "status",
-                        f"감지: {target.width}x{target.height} "
-                        + (
-                            f"견본일치 {target.match:.2f} "
-                            if target.match > -2.0
-                            else f"채움 {target.fill:.2f} "
-                        )
-                        + f"({streak}/{cfg.confirm_frames})",
+                # 한 프레임에 한 번만 누른다. 누르고 나면 화면이 바뀌므로 다른 버튼은
+                # 다음 프레임에 새로 캡처한 화면으로 다시 판단한다.
+                busy: list[str] = []
+                idle = False
+                clicked = False
+                for track in self.tracks:
+                    status, did_click = self._step_track(
+                        track,
+                        targets.get(track.kind),
+                        frames[track.region][1],
+                        now,
+                        may_click=not clicked,
                     )
+                    clicked = clicked or did_click
+                    if status == IDLE_STATUS:
+                        idle = True
+                    elif status:
+                        busy.append(status)
+                if busy:
+                    self._emit("status", " | ".join(busy))
+                elif idle:
+                    self._emit("status", IDLE_STATUS)
 
-                    ready = streak >= max(1, cfg.confirm_frames)
-                    same_button = clicked_center is not None and _close(
-                        center, clicked_center, 8.0
-                    )
-                    if not same_button:
-                        # 다른 버튼(또는 위치 이동) -> 시도 이력 초기화
-                        retries_used = 0
-                        first_attempt_at = 0.0
-                        abandoned = False
-                        warned_stuck = False
-
-                    if ready and now >= next_click_at and not abandoned:
-                        if not same_button:
-                            # 새 버튼: 첫 클릭
-                            self._handle_hit(target, scale, cfg)
-                            clicked_center = center
-                            first_attempt_at = now
-                            next_click_at = now + max(0.1, float(cfg.cooldown))
-                            streak = 0
-                            last_center = None
-                        else:
-                            # 눌렀는데도 그대로 있다.
-                            # 커서가 실제로 착지한 좌표와 지금 보이는 버튼 위치를
-                            # 비교해서 스스로 보정한 뒤 다시 누른다.
-                            limit = max(0, int(cfg.max_retries))  # 0 = 사라질 때까지
-                            timeout = max(1.0, float(cfg.retry_timeout))
-                            if now - first_attempt_at > timeout:
-                                abandoned = True
-                                # 잘못 학습했을 가능성이 있으니 다시 학습하게 한다.
-                                if cfg.auto_calibrate:
-                                    self.calibrated = False
-                                self._log(
-                                    f"{timeout:.0f}초 동안 눌러도 버튼이 사라지지 않아 "
-                                    "이 버튼은 건너뜁니다. 창이 가려졌는지, 미리보기의 "
-                                    "초록 사각형이 실제 버튼과 맞는지 확인하세요."
-                                )
-                            elif limit and retries_used >= limit:
-                                abandoned = True
-                                self._log(
-                                    f"재시도 {limit}회를 모두 사용했습니다. "
-                                    "이 버튼은 건너뜁니다."
-                                )
-                            else:
-                                retries_used += 1
-                                self._log(
-                                    "버튼이 남아 있어 재시도합니다 "
-                                    f"({retries_used}"
-                                    + (f"/{limit}" if limit else "")
-                                    + ")"
-                                )
-                                self._handle_hit(target, scale, cfg)
-                                next_click_at = now + max(0.1, float(cfg.cooldown))
-                                streak = 0
-                                last_center = None
-                        if cfg.max_clicks and self.click_count >= cfg.max_clicks:
-                            reason = f"최대 클릭 횟수({cfg.max_clicks}) 도달"
-                            break
-                    elif abandoned and not warned_stuck:
-                        warned_stuck = True
-                        self._emit("status", "건너뜀 (버튼이 사라지지 않음)")
+                if clicked and cfg.max_clicks and self.click_count >= cfg.max_clicks:
+                    reason = f"최대 클릭 횟수({cfg.max_clicks}) 도달"
+                    break
             except Exception as exc:  # 캡처 실패 등: 죽지 않고 계속
                 self._emit("error", f"{type(exc).__name__}: {exc}")
                 time.sleep(0.5)
@@ -271,12 +272,129 @@ class ScanWorker(threading.Thread):
         self.capture.close()
         self._emit("stopped", reason)
 
-    def _should_preview(
-        self, now: float, last_preview: float, target: Detection | None
-    ) -> bool:
+    def _step_track(
+        self,
+        track: _Track,
+        target: Detection | None,
+        scale: float,
+        now: float,
+        may_click: bool,
+    ) -> tuple[str | None, bool]:
+        """버튼 한 종류의 한 프레임 처리. (상태 문구, 이번에 눌렀는지)"""
+        cfg = self.config
+        if target is None:
+            status = IDLE_STATUS if track.streak else None
+            track.forget_button()  # 버튼이 사라졌으니 다음 버튼을 위해 초기화
+            return status, False
+
+        center = target.center
+        if track.last_center and _close(center, track.last_center, 6.0):
+            track.streak += 1
+        else:
+            track.streak = 1
+            track.warned_stuck = False
+        track.last_center = center
+
+        if track.kind == "accept":
+            detail = ""
+        elif target.match > -2.0:
+            detail = f"견본일치 {target.match:.2f} "
+        else:
+            detail = f"채움 {target.fill:.2f} "
+        status = (
+            f"{track.label} {target.width}x{target.height} {detail}"
+            f"({track.streak}/{cfg.confirm_frames})"
+        )
+
+        ready = track.streak >= max(1, cfg.confirm_frames)
+        same_button = track.clicked_center is not None and _close(
+            center, track.clicked_center, 8.0
+        )
+        if not same_button:
+            track.forget_attempts()  # 다른 버튼(또는 위치 이동)
+
+        if not (ready and now >= track.next_click_at and not track.abandoned):
+            if track.abandoned and not track.warned_stuck:
+                track.warned_stuck = True
+                return f"{track.label} 건너뜀 (버튼이 사라지지 않음)", False
+            return status, False
+        if not may_click:
+            return status, False  # 이번 프레임에 이미 다른 버튼을 눌렀다
+
+        if not same_button:
+            # 새 버튼: 첫 클릭
+            self._handle_hit(target, scale, track)
+            track.clicked_center = center
+            track.first_attempt_at = now
+            track.next_click_at = now + max(0.1, float(cfg.cooldown))
+            track.streak = 0
+            track.last_center = None
+            return status, True
+
+        # 눌렀는데도 그대로 있다.
+        # 커서가 실제로 착지한 좌표와 지금 보이는 버튼 위치를
+        # 비교해서 스스로 보정한 뒤 다시 누른다.
+        limit = max(0, int(cfg.max_retries))  # 0 = 사라질 때까지
+        timeout = max(1.0, float(cfg.retry_timeout))
+        if now - track.first_attempt_at > timeout:
+            track.abandoned = True
+            # 잘못 학습했을 가능성이 있으니 다시 학습하게 한다 (보라색 기준만 학습함).
+            if track is self.allow and cfg.auto_calibrate:
+                self.calibrated = False
+            self._log(
+                f"{track.label}: {timeout:.0f}초 동안 눌러도 버튼이 사라지지 않아 "
+                "이 버튼은 건너뜁니다. 창이 가려졌는지, 미리보기의 "
+                "초록 사각형이 실제 버튼과 맞는지 확인하세요."
+            )
+            return status, False
+        if limit and track.retries_used >= limit:
+            track.abandoned = True
+            self._log(
+                f"{track.label}: 재시도 {limit}회를 모두 사용했습니다. "
+                "이 버튼은 건너뜁니다."
+            )
+            return status, False
+
+        track.retries_used += 1
+        count = f"{track.retries_used}" + (f"/{limit}" if limit else "")
+        if track.kind == "accept":
+            # 변경이 여러 개면 다음 변경의 Accept 가 같은 자리에 뜬다. 그것도 누른다.
+            self._log(f"Accept 가 그대로 있어 다시 누릅니다 ({count}, 다음 변경이거나 "
+                      "앞 클릭이 무시됨)")
+        else:
+            self._log(f"버튼이 남아 있어 재시도합니다 ({count})")
+        self._handle_hit(target, scale, track)
+        track.next_click_at = now + max(0.1, float(cfg.cooldown))
+        track.streak = 0
+        track.last_center = None
+        return status, True
+
+    def _preview_payload(
+        self,
+        frames: dict[Region, tuple[np.ndarray, float]],
+        targets: dict[str, Detection | None],
+    ) -> tuple[np.ndarray, float, list[Detection]]:
+        """미리보기로 보낼 (이미지, 배율, 표시할 대상들).
+
+        버튼이 보이는 영역을 보여준다. 둘 다 없으면 기본 감시 영역을 보여준다.
+        """
+        shown_region = self.allow.region
+        for track in self.tracks:
+            if targets.get(track.kind) is not None:
+                shown_region = track.region
+                break
+        image, scale = frames[shown_region]
+        shown = [
+            targets[track.kind]
+            for track in self.tracks
+            if track.region == shown_region and targets.get(track.kind) is not None
+        ]
+        return image, scale, shown
+
+    def _should_preview(self, now: float, last_preview: float, has_target: bool) -> bool:
         if now - last_preview >= PREVIEW_MIN_INTERVAL:
             return True
-        return target is not None and now - last_preview >= 0.1
+        return has_target and now - last_preview >= 0.1
 
     def _auto_calibrate(self, image: np.ndarray) -> bool:
         """영역에서 버튼처럼 보이는 것을 스스로 찾아 인식 기준을 학습한다.
@@ -352,12 +470,14 @@ class ScanWorker(threading.Thread):
         self._emit("calibrated", result)
         return True
 
-    def _to_screen(self, cx: float, cy: float, scale: float) -> tuple[int, int]:
+    def _to_screen(
+        self, cx: float, cy: float, scale: float, region: Region
+    ) -> tuple[int, int]:
         """캡처 이미지 좌표 -> 화면 좌표 (학습된 보정 포함)."""
         factor = max(scale, 1e-6)
         return (
-            int(round(self.region.x + cx / factor + self.offset[0])),
-            int(round(self.region.y + cy / factor + self.offset[1])),
+            int(round(region.x + cx / factor + self.offset[0])),
+            int(round(region.y + cy / factor + self.offset[1])),
         )
 
     def _apply_offset(self, dx: int, dy: int, why: str) -> bool:
@@ -375,18 +495,23 @@ class ScanWorker(threading.Thread):
         self._emit("offset", (new_x, new_y))
         return True
 
-    def _handle_hit(self, target: Detection, scale: float, cfg: AppConfig) -> None:
+    def _handle_hit(self, target: Detection, scale: float, track: _Track) -> None:
         """버튼을 클릭한다.
 
         누르기 전에 '커서가 실제로 어디에 있는지' 확인하는 것이 핵심이다.
         요청한 좌표와 실제 좌표가 다르면(배율/좌표계 문제) 그 차이를 학습해서
         다시 이동한 뒤에 누른다. 그래서 첫 클릭부터 제대로 들어간다.
         """
+        cfg: AppConfig = self.config
+        region = track.region
         cx, cy = target.center
-        screen_x, screen_y = self._to_screen(cx, cy, scale)
+        screen_x, screen_y = self._to_screen(cx, cy, scale, region)
 
         if cfg.dry_run:
-            self._log(f"[테스트] 클릭 대상 좌표 ({screen_x}, {screen_y}) - 실제 클릭 안 함")
+            self._log(
+                f"[테스트] {track.label} 클릭 대상 좌표 ({screen_x}, {screen_y}) "
+                "- 실제 클릭 안 함"
+            )
             self.last_click = {"requested": (screen_x, screen_y), "actual": None}
             return
 
@@ -413,7 +538,7 @@ class ScanWorker(threading.Thread):
             and (abs(actual[0] - screen_x) > 1 or abs(actual[1] - screen_y) > 1)
         ):
             screen_x, screen_y, actual = self._confirm_and_correct(
-                cx, cy, scale, screen_x, screen_y, actual
+                cx, cy, scale, region, screen_x, screen_y, actual
             )
 
         if HOVER_SETTLE_SECONDS > 0:
@@ -423,7 +548,7 @@ class ScanWorker(threading.Thread):
 
         self.click_count += 1
         where = actual if actual is not None else (screen_x, screen_y)
-        self._log(f"클릭! {tuple(where)}  누적 {self.click_count}회")
+        self._log(f"클릭! {track.label} {tuple(where)}  누적 {self.click_count}회")
         self._emit("click", self.click_count)
 
         if origin:
@@ -438,6 +563,7 @@ class ScanWorker(threading.Thread):
         cx: float,
         cy: float,
         scale: float,
+        region: Region,
         screen_x: int,
         screen_y: int,
         first: tuple[int, int],
@@ -477,7 +603,7 @@ class ScanWorker(threading.Thread):
             return screen_x, screen_y, second
 
         if self._apply_offset(dx, dy, f"같은 차이가 두 번 확인됨 (요청 대비 {second})"):
-            new_x, new_y = self._to_screen(cx, cy, scale)
+            new_x, new_y = self._to_screen(cx, cy, scale, region)
             return new_x, new_y, self._move_and_verify(new_x, new_y)
         return screen_x, screen_y, second
 

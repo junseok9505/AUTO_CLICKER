@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .detector import ButtonTemplate, DetectorConfig
+from .detector import AcceptConfig, ButtonTemplate, DetectorConfig
 from .geometry import Region
 
 CONFIG_FILENAME = "config.json"
@@ -39,6 +39,11 @@ class AppConfig:
     auto_offset: bool = True  # 클릭 좌표 자동 보정
     click_offset_x: int = 0  # 학습된 보정값
     click_offset_y: int = 0
+    # Review changes 패널의 초록 Accept 버튼. Allow 와 뜨는 자리가 달라서
+    # 감시 영역을 따로 둘 수 있다. None 이면 기본 감시 영역에서 찾는다.
+    accept_enabled: bool = True
+    accept_region: Region | None = None
+    accept: AcceptConfig = field(default_factory=AcceptConfig)
     notes: list[str] = field(default_factory=list)  # 불러올 때 생긴 안내 (저장 안 함)
 
     def to_dict(self) -> dict:
@@ -62,6 +67,9 @@ class AppConfig:
             "auto_offset": self.auto_offset,
             "click_offset_x": self.click_offset_x,
             "click_offset_y": self.click_offset_y,
+            "accept_enabled": self.accept_enabled,
+            "accept_region": self.accept_region.to_dict() if self.accept_region else None,
+            "accept": self.accept.to_dict(),
         }
 
     @classmethod
@@ -74,6 +82,8 @@ class AppConfig:
         cfg.template = ButtonTemplate.from_dict(data.get("template"))
         cfg.detector = DetectorConfig.from_dict(data.get("detector"))
         cfg.notes = _upgrade_detector(cfg.detector, data.get("detector"))
+        cfg.accept_region = Region.from_dict(data.get("accept_region"))
+        cfg.accept = AcceptConfig.from_dict(data.get("accept"))
         for key in (
             "interval",
             "cooldown",
@@ -90,6 +100,7 @@ class AppConfig:
             "auto_offset",
             "click_offset_x",
             "click_offset_y",
+            "accept_enabled",
         ):
             if data.get(key) is not None:
                 current = getattr(cfg, key)
