@@ -16,6 +16,9 @@ CONFIG_FILENAME = "config.json"
 # 채도 0.31/명도 0.27) 같은 '옅게 깔린 같은 색'까지 버튼 후보로 통과시켜서,
 # 화면 곳곳의 어두운 보라 덩어리를 버튼으로 오인하게 만든다.
 _OUTDATED_DEFAULTS = {"sat_min": 0.28, "val_min": 0.25}
+# Accept 글자 채도 하한 0.35 는 Windows 100% 배율 기준이다. macOS 는 Retina 화면을
+# 1x 로 캡처해서 글자 색이 배경과 섞이고, Accept 글자 채도가 최대 0.30 까지 떨어진다.
+_OUTDATED_ACCEPT_DEFAULTS = {"text_sat_min": 0.35}
 
 
 @dataclass
@@ -84,6 +87,7 @@ class AppConfig:
         cfg.notes = _upgrade_detector(cfg.detector, data.get("detector"))
         cfg.accept_region = Region.from_dict(data.get("accept_region"))
         cfg.accept = AcceptConfig.from_dict(data.get("accept"))
+        cfg.notes += _upgrade_accept(cfg.accept, data.get("accept"))
         for key in (
             "interval",
             "cooldown",
@@ -131,6 +135,25 @@ def _upgrade_detector(detector: DetectorConfig, stored: dict | None) -> list[str
         return [
             "인식 기준을 새 기본값으로 올렸습니다 (" + ", ".join(notes) + "). "
             "예전 값은 대화 본문의 옅은 보라 배경까지 버튼으로 인식했습니다."
+        ]
+    return []
+
+
+def _upgrade_accept(accept: AcceptConfig, stored: dict | None) -> list[str]:
+    """Accept 기준도 손대지 않은 예전 기본값이면 새 기본값으로 올린다."""
+    if not stored:
+        return []
+    fresh = AcceptConfig()
+    notes: list[str] = []
+    for key, old_default in _OUTDATED_ACCEPT_DEFAULTS.items():
+        new_default = getattr(fresh, key)
+        if abs(float(stored.get(key, new_default)) - old_default) < 1e-9:
+            setattr(accept, key, new_default)
+            notes.append(f"{key} {old_default:g} -> {new_default:g}")
+    if notes:
+        return [
+            "Accept 인식 기준을 새 기본값으로 올렸습니다 (" + ", ".join(notes) + "). "
+            "예전 값은 맥에서 옅게 찍히는 Accept 글자를 놓쳤습니다."
         ]
     return []
 

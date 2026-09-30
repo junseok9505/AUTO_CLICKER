@@ -1,7 +1,7 @@
 """macOS 구현 (CoreGraphics 를 ctypes 로 직접 호출, pyobjc 불필요).
 
-주의: Windows 에서 먼저 개발했기 때문에 이 파일은 실제 macOS 에서 검증되지 않았다.
-맥 작업을 할 때는 이 파일만 확인/보정하면 된다. 필요한 권한은 두 가지다.
+실제 맥(Retina + 외장 모니터)에서 Chrome 과 Kiro 버튼 클릭을 확인했다.
+필요한 권한은 두 가지다.
   - 화면 기록(Screen Recording): 화면 캡처
   - 손쉬운 사용(Accessibility): 마우스 클릭 주입
 """
@@ -22,6 +22,13 @@ kCGMouseButtonLeft = 0
 kCGHIDEventTap = 0
 kCGEventSourceStateHIDSystemState = 1
 kVK_F8 = 100
+# CGEventField. 마우스 이벤트의 '클릭 횟수'다.
+# CGEventCreateMouseEvent 로 만든 이벤트는 이 값이 0이고, 그 상태로 보내면
+# Chromium 기반 앱(Kiro, VS Code, Chrome 등)은 누름/뗌을 아예 버린다.
+# 실측: 같은 좌표에 clickState 미설정으로 보내면 mousedown 조차 발생하지 않고,
+# 1 로 설정하면 mousedown/mouseup/click 이 모두 전달된다.
+kCGMouseEventClickState = 1
+SINGLE_CLICK = 1
 
 
 class CGPoint(ctypes.Structure):
@@ -66,6 +73,11 @@ class MacAdapter(PlatformAdapter):
             ctypes.c_uint32,
         ]
         cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+        cg.CGEventSetIntegerValueField.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_int64,
+        ]
         cg.CGEventCreate.restype = ctypes.c_void_p
         cg.CGEventCreate.argtypes = [ctypes.c_void_p]
         cg.CGEventGetLocation.restype = CGPoint
@@ -173,24 +185,31 @@ class MacAdapter(PlatformAdapter):
 
     def press_left(self, hold: float = CLICK_HOLD_SECONDS) -> None:
         # 누름/뗌은 '현재 커서 위치'에서 발생시킨다.
+        # click_state 를 반드시 넘긴다. 0 이면 Chromium 계열 앱이 이벤트를 버린다.
         x, y = self.cursor_position()
-        self._post(kCGEventLeftMouseDown, float(x), float(y))
+        self._post(kCGEventLeftMouseDown, float(x), float(y), SINGLE_CLICK)
         if hold > 0:
             time.sleep(hold)
-        self._post(kCGEventLeftMouseUp, float(x), float(y))
+        self._post(kCGEventLeftMouseUp, float(x), float(y), SINGLE_CLICK)
 
     def click(self, x: int, y: int) -> None:
         self.move_cursor(x, y)
         self.wait_for_cursor(x, y)
         self.press_left()
 
-    def _post(self, event_type: int, x: float, y: float) -> None:
+    def _post(
+        self, event_type: int, x: float, y: float, click_state: int = 0
+    ) -> None:
         event = self._cg.CGEventCreateMouseEvent(
             None, event_type, CGPoint(x, y), kCGMouseButtonLeft
         )
         if not event:
             raise OSError("CGEventCreateMouseEvent 실패 (손쉬운 사용 권한 확인)")
         try:
+            if click_state:
+                self._cg.CGEventSetIntegerValueField(
+                    event, kCGMouseEventClickState, int(click_state)
+                )
             self._cg.CGEventPost(kCGHIDEventTap, event)
         finally:
             self._cf.CFRelease(event)
@@ -237,5 +256,4 @@ class MacAdapter(PlatformAdapter):
             "macOS 15 이상에서는 mss 가 쓰는 레거시 화면 캡처 API 때문에 권한 프롬프트가 "
             "반복될 수 있습니다. 그럴 때는 검사 간격을 늘리고, 권한을 터미널이 아니라 "
             "앱 번들에 부여하세요.",
-            "이 macOS 구현은 아직 실기 검증 전입니다. 먼저 테스트 모드로 확인하세요.",
         ]

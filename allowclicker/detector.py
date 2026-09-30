@@ -996,6 +996,10 @@ def calibrate_from_rect(
 #   Accept 버튼 면 #2A3233 (채도 0.18, 명도 0.20)
 #   Reject 글자 #B0524E 부근 (색상 2°, 채도 0.56, 명도 0.69), Accept 오른쪽 24px
 #   패널 배경 #211D25
+# 실측 (macOS Retina, mss 1x 캡처): Retina 화면을 1x 로 줄여 찍기 때문에 얇은 글자
+# 획이 어두운 배경과 섞인다. 그래서 색이 크게 옅어진다.
+#   Accept 글자 채도 중앙 0.28 / 최대 0.30, 명도 중앙 0.61  (0.35 이상인 픽셀 0개)
+#   Reject 글자 채도 중앙 0.38 / 최대 0.41, 명도 중앙 0.58
 # 같은 줄 위에 있는 초록 체크 아이콘(14x10)은 글자가 아니라 한 덩어리라 걸러진다.
 # ---------------------------------------------------------------------------
 
@@ -1009,7 +1013,9 @@ class AcceptConfig:
     # 짝 버튼(Reject) 글자색. Accept 바로 오른쪽 같은 줄에 있어야 한다.
     partner_hue: float = 0.0  # 빨강
     partner_hue_tolerance: float = 25.0
-    text_sat_min: float = 0.35
+    # 맥 1x 캡처의 Accept 글자(채도 최대 0.30)가 통과하도록 낮게 둔다.
+    # 채도가 낮은 초록 잡티가 더 들어오지만, 오른쪽 Reject 짝 조건이 걸러낸다.
+    text_sat_min: float = 0.20
     text_val_min: float = 0.45
     min_text_height: int = 7
     max_text_height: int = 60
